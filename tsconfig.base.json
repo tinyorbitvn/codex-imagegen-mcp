@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"],
+
+    // Import nội bộ viết đuôi ".ts" là CÓ CHỦ ĐÍCH: test chạy thẳng file
+    // nguồn bằng `node --test --experimental-strip-types`, mà bộ
+    // strip-types của Node KHÔNG phân giải hộ đuôi. Hai cờ dưới cho phép
+    // điều đó nhưng vẫn emit được JS chạy production (tsc tự đổi .ts -> .js).
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
+  }
+}

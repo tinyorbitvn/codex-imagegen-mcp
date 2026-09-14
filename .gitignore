@@ -1,0 +1,11 @@
+# Sinh ra lúc build/test, không commit.
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Không bao giờ commit: repo này công khai.
+.env
+.env.*
+*.pem
+*.key
+*.b64
