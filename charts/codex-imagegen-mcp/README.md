@@ -1,62 +1,66 @@
 # codex-imagegen-mcp Helm chart
 
-Deploys the MCP server and the Codex worker on Kubernetes.
+Deploys the MCP image generator. By default that is **one pod and nothing
+else**: the queue lives in the process and images are written to a volume and
+served from the same port.
 
 ```bash
 helm install imagegen ./charts/codex-imagegen-mcp \
   --namespace imagegen --create-namespace \
-  --set s3.endpoint=https://s3.example.com \
-  --set s3.bucket=imagegen-artifacts \
-  --set s3.publicBaseUrl=https://s3.example.com/imagegen-artifacts \
-  --set s3.accessKeyId=... --set s3.secretAccessKey=... \
-  --set redis.url=redis://redis-master.redis:6379
+  --set publicBaseUrl=https://mcp.example.com
 ```
 
-Then sign in to ChatGPT once, into the worker's volume:
+`publicBaseUrl` is the one thing you must supply, because it is the URL
+clients are handed for a generated image and only you know what resolves from
+where they run. Enable the ingress instead and it is taken from the host.
+
+Then sign in to ChatGPT once, into the pod's volume:
 
 ```bash
-kubectl -n imagegen exec -it deploy/imagegen-codex-imagegen-mcp-worker -- codex login --device-auth
-kubectl -n imagegen rollout restart deploy/imagegen-codex-imagegen-mcp-worker
+kubectl -n imagegen exec -it deploy/imagegen-codex-imagegen-mcp -- codex login --device-auth
 ```
 
 No image contains credentials. Until that sign-in exists, every job fails.
 
+## Growing out of one pod
+
+| Want | Set |
+|---|---|
+| A real queue | `redis.url` |
+| Object storage instead of a volume | `s3.endpoint`, `s3.bucket`, `s3.publicBaseUrl`, and credentials |
+| The MCP endpoint scaled or restarted without touching the Codex process | `split=true`, which then requires both of the above |
+
+Each of those is independent. Storage can move to S3 while the queue stays in
+the process, and the chart refuses only the combinations that cannot work.
+
 ## What gets created
 
-| Object | Purpose |
+| Object | When |
 |---|---|
-| Deployment + Service (MCP) | The `/mcp` endpoint. Stateless, scales horizontally. |
-| Deployment + Service (worker) | Runs the Codex CLI. Holds the ChatGPT session. |
-| PersistentVolumeClaim `-codex-home` | The sign-in. Annotated `helm.sh/resource-policy: keep`, so uninstalling the release does not throw it away. |
-| Secret `-s3` | Object storage credentials, unless you point at `s3.existingSecret`. |
-| Deployment + Service `-redis` | Only when `redis.deploy=true`. Evaluation only: one pod, no persistence. |
-| Ingress | Only when `ingress.enabled=true`. |
-
-## Values you have to set
-
-| Key | Why |
-|---|---|
-| `s3.endpoint` | Where generated images are written. |
-| `s3.bucket` | Must already exist; the chart does not create it. |
-| `s3.publicBaseUrl` | The URL handed to MCP clients. Final link is this plus `/` plus the object key, unsigned, so the bucket must allow anonymous download. |
-| `s3.existingSecret` or `s3.accessKeyId` + `s3.secretAccessKey` | Credentials for that bucket. |
-| `redis.url` or `redis.deploy=true` | The queue between the two services. |
-
-The chart refuses to render with a message naming the missing one, rather
-than letting pods crash-loop on an unset variable.
+| Deployment + Service | always. Runs both roles, or the MCP role when split. |
+| Deployment + Service `-worker` | only with `split=true` |
+| PVC `-codex-home` | the ChatGPT sign-in. `helm.sh/resource-policy: keep`, so uninstalling does not throw it away. |
+| PVC `-artifacts` | when images are stored locally. Also kept on uninstall, because URLs already handed out point at it. |
+| PVC `-work` | only when `persistence.work.enabled` |
+| Secret `-s3` | only when `s3.endpoint` is set without `s3.existingSecret` |
+| Deployment + Service `-redis` | only with `redis.deploy=true`. Evaluation only: one pod, no persistence. |
+| Ingress | only with `ingress.enabled=true` |
 
 ## Values worth knowing about
 
 | Key | Default | Note |
 |---|---|---|
-| `worker.replicaCount` | `1` | One ChatGPT sign-in drives one Codex process. More replicas need one sign-in volume each, and the chart blocks the combination that would silently share one. |
-| `worker.concurrency` | `1` | Same reason, within a replica. |
+| `split` | `false` | One process, so no Redis and no object storage needed. |
+| `replicaCount` | `1` | Only raisable with `split=true`. Without it, each replica would hold its own queue and its own sign-in, and the chart refuses. |
+| `worker.concurrency` | `1` | One ChatGPT sign-in drives one Codex process. |
 | `worker.jobTimeoutSeconds` | `900` | Real jobs take 30 to 140 seconds. |
 | `worker.generatedImageRetentionHours` | `24` | Codex keeps its own copy of every image, roughly 0.7 MB per job. This is how long those copies live. |
-| `worker.persistence.codexHome.size` | `1Gi` | Holds the sign-in plus Codex's own image copies. |
-| `mcp.replicaCount` | `2` | Stateless, so raise it freely. |
-| `mcp.rateLimit.*` | 10 create, 20 edit per hour | Per caller, read from `x-agentgateway-principal`, `x-jwt-sub` or `x-user`. With no proxy in front, every caller is `anonymous` and shares one bucket. |
+| `persistence.artifacts.size` | `10Gi` | Only used when images are stored locally. |
+| `rateLimit.*` | 10 create, 20 edit per hour | Per caller, read from `x-agentgateway-principal`, `x-jwt-sub` or `x-user`. With no proxy in front, every caller is `anonymous` and shares one bucket. |
 | `otlp.endpoint` | `""` | Empty disables OpenTelemetry export. |
+
+The chart fails to render, naming the value to set, rather than letting pods
+crash-loop on a missing variable.
 
 ## Exposure
 

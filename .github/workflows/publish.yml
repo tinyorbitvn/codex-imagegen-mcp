@@ -1,16 +1,9 @@
-# Build both service images and publish them to GitHub Packages (ghcr.io),
-# then cut a GitHub Release, whenever a `v*` tag is pushed.
+# Build the image, publish it to GitHub Packages (ghcr.io), then cut a
+# GitHub Release, whenever a `v*` tag is pushed.
 #
-# Why tags only, and not every push: these images are what the cluster actually
-# runs, so every image must correspond to a version you can name. For quick
+# Why tags only, and not every push: this image is what people actually run,
+# so every image must correspond to a version you can name. For quick
 # experiments build locally instead of littering a public registry with tags.
-#
-# Both images carry the SAME version as the tag. This is one npm workspace and
-# the two services share `packages/*`, so splitting their versions would make it
-# impossible to say which build of one goes with which build of the other.
-#
-# The build context is the REPOSITORY ROOT, not the service directory, because
-# each Dockerfile copies `packages/` as well. See the comments in the Dockerfiles.
 name: Publish
 
 on:
@@ -26,14 +19,6 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    strategy:
-      # The two images are independent: one failing should not stop the other
-      # from being published.
-      fail-fast: false
-      matrix:
-        service:
-          - imagegen-mcp
-          - codex-image-worker
     steps:
       - uses: actions/checkout@v4
 
@@ -51,25 +36,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push ${{ matrix.service }}
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          # Repository root, not services/<name>.
           context: .
-          file: services/${{ matrix.service }}/Dockerfile
           push: true
-          # BASE_REGISTRY keeps its default (docker.io/library): a public runner
-          # cannot reach TinyOrbit's internal registry, and should not try to.
+          # BASE_REGISTRY keeps its default (docker.io/library): a public
+          # runner has no private mirror to reach, and should not try.
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ steps.ver.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:latest
+            ghcr.io/${{ github.repository_owner }}/codex-imagegen-mcp:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/codex-imagegen-mcp:latest
           # Cache between runs so a rebuild costs minutes, not tens of minutes.
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   release:
-    # Only cut a release once both images are actually on the registry, so the
-    # pull commands in the release notes are never a lie.
+    # Only cut a release once the image is actually on the registry, so the
+    # pull command in the release notes is never a lie.
     needs: publish
     runs-on: ubuntu-latest
     permissions:
@@ -88,18 +71,13 @@ jobs:
           version="${TAG#v}"
           previous="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
           {
-            echo "## Container images"
+            echo "## Container image"
             echo
-            echo "Both images are public — no login needed to pull them."
+            echo "Public, so pulling needs no login."
             echo
             echo '```bash'
-            echo "docker pull ghcr.io/${OWNER}/imagegen-mcp:${version}"
-            echo "docker pull ghcr.io/${OWNER}/codex-image-worker:${version}"
+            echo "docker pull ghcr.io/${OWNER}/codex-imagegen-mcp:${version}"
             echo '```'
-            echo
-            echo "They share one version on purpose: both services live in a single npm"
-            echo "workspace and depend on the same \`packages/*\`, so a matching pair is"
-            echo "the only combination that is tested together."
             echo
             echo "## Changes"
             echo

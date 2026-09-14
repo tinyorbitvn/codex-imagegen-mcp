@@ -1,8 +1,16 @@
 {{ .Chart.Name }} {{ .Chart.Version }} installed as release {{ .Release.Name }}.
 
+{{ if .Values.split -}}
+Layout: split. One Deployment serves MCP, one runs Codex.
+{{- else -}}
+Layout: single pod. One process serves MCP and generates images.
+{{- end }}
+Queue:   {{ if or .Values.redis.url .Values.redis.deploy }}Redis{{ else }}in process{{ end }}
+Storage: {{ if .Values.s3.endpoint }}object storage at {{ .Values.s3.endpoint }}{{ else }}local volume, served from /artifacts{{ end }}
+
 The MCP endpoint is:
 
-  http://{{ include "codex-imagegen-mcp.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.mcp.service.port }}/mcp
+  http://{{ include "codex-imagegen-mcp.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/mcp
 
 {{ if .Values.ingress.enabled }}From outside the cluster:
 {{- range .Values.ingress.hosts }}
@@ -10,25 +18,26 @@ The MCP endpoint is:
 {{- end }}
 {{ else }}Try it from your machine with a port-forward:
 
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "codex-imagegen-mcp.fullname" . }} 8080:{{ .Values.mcp.service.port }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "codex-imagegen-mcp.fullname" . }} 8080:{{ .Values.service.port }}
 {{ end }}
-ONE STEP IS LEFT. The worker cannot generate anything until it has a Codex
-sign-in, and no image ships with credentials. Sign in once, into the
-worker's volume:
+ONE STEP IS LEFT. Nothing can be generated until there is a Codex sign-in,
+and no image ships with credentials. Sign in once, into the volume:
 
-  kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "codex-imagegen-mcp.fullname" . }}-worker -- codex login --device-auth
+  kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "codex-imagegen-mcp.fullname" . }}{{ if .Values.split }}-worker{{ end }} -- codex login --device-auth
 
-Follow the printed URL and code, then restart the worker:
+Follow the printed URL and code. The pod reports ready within a readiness
+period; no restart needed. Check it took:
 
-  kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "codex-imagegen-mcp.fullname" . }}-worker
-
-Check it took:
-
-  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "codex-imagegen-mcp.fullname" . }}-worker -- codex login status
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "codex-imagegen-mcp.fullname" . }}{{ if .Values.split }}-worker{{ end }} -- codex login status
 {{- if .Values.redis.deploy }}
 
 WARNING: redis.deploy=true runs a single Redis pod with no persistence.
 A restart drops the queue and every job waiting in it.
+{{- end }}
+{{- if and (not .Values.s3.endpoint) (not .Values.persistence.artifacts.enabled) }}
+
+WARNING: artifacts are on an emptyDir. Every image URL already handed to a
+client stops working when the pod restarts.
 {{- end }}
 
 Anything that can reach /mcp can spend your ChatGPT quota. The service does

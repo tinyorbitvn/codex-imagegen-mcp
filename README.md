@@ -11,11 +11,11 @@ of whatever you already pay OpenAI. A ChatGPT subscription can already
 generate images, and the official Codex CLI can drive it. What was missing was
 a way for an MCP client to reach that.
 
-So: sign in to Codex once with your ChatGPT account, run these two services,
-and point any MCP client at the endpoint. Images come back as URLs. Nothing
-here ever reads `OPENAI_API_KEY` — the worker builds the Codex process's
-environment from an allowlist, so even if that variable is set on the host it
-is never forwarded. Spending the subscription is the entire point.
+So: sign in to Codex once with your ChatGPT account, run one container, and
+point any MCP client at it. Images come back as URLs. Nothing here ever reads
+`OPENAI_API_KEY` — the Codex process's environment is built from an allowlist,
+so even if that variable is set on the host it is never forwarded. Spending
+the subscription is the entire point.
 
 What you should know before relying on it:
 
@@ -24,11 +24,15 @@ What you should know before relying on it:
   account faster.
 - **An image takes 30 to 140 seconds.** The MCP tool waits for you and reports
   progress, so clients do not have to poll.
-- **Your account's terms and quotas apply.** This project automates the
-  official CLI with your own credentials. It does not bypass anything, and it
-  gives you no more capacity than your plan already has.
+- **Your account's terms and quotas apply.** This automates the official CLI
+  with your own credentials. It does not bypass anything, and it gives you no
+  more capacity than your plan already has.
 
 ## Quick start
+
+One container. No database, no object storage, no message broker: with
+neither Redis nor S3 configured the process keeps its queue in memory and
+writes images to a volume, serving them from the same port it serves MCP on.
 
 Requires Docker with the Compose plugin, and a ChatGPT account that can use
 Codex.
@@ -36,23 +40,20 @@ Codex.
 ```bash
 git clone https://github.com/tinyorbitvn/codex-imagegen-mcp.git
 cd codex-imagegen-mcp
-cp .env.example .env
 docker compose up -d
 ```
 
-That brings up Redis, MinIO for storage, the MCP server on port 8080 and the
-worker. One step is left, because no image ships with credentials:
+One step is left, because no image ships with credentials:
 
 ```bash
-docker compose run --rm codex-login
+docker compose exec codex-imagegen-mcp codex login --device-auth
 ```
 
-Follow the printed URL and code to sign in with your ChatGPT account, then
-restart the worker so it picks the session up:
+Follow the printed URL and code to sign in with your ChatGPT account. The
+container reports ready within a few seconds:
 
 ```bash
-docker compose restart codex-image-worker
-docker compose exec codex-image-worker codex login status
+docker compose exec codex-imagegen-mcp codex login status
 ```
 
 Now connect a client. For Claude Code:
@@ -64,8 +65,9 @@ claude mcp add --transport http imagegen http://localhost:8080/mcp
 Any MCP client that speaks Streamable HTTP works the same way; the endpoint is
 `POST /mcp` and there is no session handshake.
 
-Ask for an image and you get back a URL served by MinIO. Stop everything with
-`docker compose down`; add `-v` to throw away the sign-in and the images too.
+Ask for an image and you get back a URL served by the same container. Stop it
+with `docker compose down`; add `-v` to throw away the sign-in and the images
+too.
 
 ## The tools
 
@@ -81,43 +83,46 @@ For animated web graphics, ask for each independently moving object in its own
 `create_image` call with `isolated_object: true`. A single combined scene
 cannot be split into layers afterwards.
 
+## Growing beyond one container
+
+The same image runs three ways, chosen by the `ROLE` environment variable.
+`all` is the default and does everything in one process. `mcp` and `worker`
+split the endpoint from the Codex process, which lets you restart or scale the
+endpoint without touching the session that holds your ChatGPT sign-in.
+
+Splitting needs a shared queue and shared storage, because two processes share
+neither memory nor a local disk. Set `REDIS_URL` and the `S3_*` variables and
+they replace the in-process queue and the local artifact directory. Each is
+independent: storage can move to S3 while the queue stays in the process.
+
 ## Kubernetes
 
 ```bash
 helm install imagegen ./charts/codex-imagegen-mcp \
   --namespace imagegen --create-namespace \
-  --set s3.endpoint=https://s3.example.com \
-  --set s3.bucket=imagegen-artifacts \
-  --set s3.publicBaseUrl=https://s3.example.com/imagegen-artifacts \
-  --set s3.accessKeyId=... --set s3.secretAccessKey=... \
-  --set redis.url=redis://redis-master.redis:6379
+  --set publicBaseUrl=https://mcp.example.com
 ```
 
-Then sign in once inside the worker pod, the same way as above. The chart
-keeps that sign-in on its own volume, annotated so an uninstall does not throw
-it away. See [charts/codex-imagegen-mcp/README.md](charts/codex-imagegen-mcp/README.md)
-and [docs/deployment-kubernetes.md](docs/deployment-kubernetes.md).
+That is one pod, one volume for the sign-in and one for the images. Then sign
+in once inside the pod, the same way as above. See
+[charts/codex-imagegen-mcp/README.md](charts/codex-imagegen-mcp/README.md) and
+[docs/deployment-kubernetes.md](docs/deployment-kubernetes.md).
 
 **The MCP endpoint authenticates nobody.** Anything that can reach it can
 spend your ChatGPT quota. Keep it inside your network, or put an
 authenticating proxy in front.
 
-## Images
+## Image
 
 Published to GitHub Packages on every `v*` tag, public, no login needed:
 
 ```bash
-docker pull ghcr.io/tinyorbitvn/imagegen-mcp:latest
-docker pull ghcr.io/tinyorbitvn/codex-image-worker:latest
+docker pull ghcr.io/tinyorbitvn/codex-imagegen-mcp:latest
 ```
-
-Both images always carry the same version: they live in one npm workspace and
-share `packages/*`, so a matching pair is the only combination that is tested
-together.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — what the two services do and why they are split
+- [Architecture](docs/architecture.md) — what runs where, and why it can be one process
 - [Configuration](docs/configuration.md) — every environment variable
 - [Codex authentication](docs/codex-authentication.md) — the sign-in, where it lives, how to renew it
 - [Kubernetes deployment](docs/deployment-kubernetes.md)
@@ -125,14 +130,13 @@ together.
 
 ## Development
 
-An npm workspace. Both services depend on `packages/*` at version `*`, so
-builds run from the repository root and the Dockerfiles copy `packages/` in.
+One npm package, no workspaces.
 
 ```bash
 npm ci
 npm run typecheck
 npm test
-docker build -f services/imagegen-mcp/Dockerfile -t imagegen-mcp:dev .
+docker build -t codex-imagegen-mcp:dev .
 ```
 
 ## License

@@ -25,8 +25,8 @@ The chart's claim carries `helm.sh/resource-policy: keep`, so uninstalling the
 release does not delete the sign-in. Losing that volume means signing in
 again, nothing worse.
 
-The claim is ReadWriteOnce on purpose. If someone raises the worker replica
-count, the second pod gets stuck Pending because it cannot mount the volume.
+The claim is ReadWriteOnce on purpose. If someone raises the replica count,
+the second pod gets stuck Pending because it cannot mount the volume.
 That is the failure landing in the right place: two Codex processes racing to
 rewrite the same token file would be worse and much harder to notice. A
 ReadWriteMany storage class would quietly remove that guard.
@@ -40,29 +40,29 @@ line, never in anything returned over MCP.
 ### Docker Compose
 
 ```bash
-docker compose run --rm codex-login
+docker compose exec codex-imagegen-mcp codex login --device-auth
 ```
 
-That runs `codex login --device-auth` against the same volume the worker
-reads. It prints a short URL and a code; open the URL anywhere you have a
-browser, enter the code, approve. Then:
+It prints a short URL and a code; open the URL anywhere you have a browser,
+enter the code, approve. The process notices the new session on its own, so
+no restart is needed. Confirm:
 
 ```bash
-docker compose restart codex-image-worker
-docker compose exec codex-image-worker codex login status
+docker compose exec codex-imagegen-mcp codex login status
 ```
 
 ### Kubernetes
 
 ```bash
-kubectl -n <namespace> exec -it deploy/<release>-worker -- codex login --device-auth
+kubectl -n <namespace> exec -it deploy/<release> -- codex login --device-auth
 ```
 
-Same flow. The pod becomes ready again within about one readiness period, so a
-restart is usually unnecessary. Confirm:
+Same flow. With `split=true`, target the `-worker` Deployment instead, since
+that is the pod holding the session. The pod becomes ready again within about
+one readiness period, so a restart is usually unnecessary. Confirm:
 
 ```bash
-kubectl -n <namespace> exec deploy/<release>-worker -- \
+kubectl -n <namespace> exec deploy/<release> -- \
   node -e "fetch('http://127.0.0.1:8080/health/ready').then(r=>r.text()).then(console.log)"
 ```
 
@@ -113,8 +113,8 @@ this either.
 Three independent places would each have to be changed for the worker to use
 one:
 
-1. `services/codex-image-worker/src/config.ts` never reads `OPENAI_API_KEY`.
-2. `services/codex-image-worker/src/runner.ts` builds the Codex child
+1. `src/config.ts` never reads `OPENAI_API_KEY`.
+2. `src/worker/runner.ts` builds the Codex child
    process's environment from an allowlist: `CODEX_HOME`, `HOME`, `PATH`,
    `TMPDIR`, `LANG`, `TERM`. Anything not on that list is invisible to Codex
    even when the container has it set.
@@ -127,8 +127,7 @@ which is the point.
 
 ## Upgrading the Codex CLI
 
-The version is pinned in `services/codex-image-worker/Dockerfile` as
-`CODEX_VERSION`. The worker builds a fixed command line, and Codex renames
+The version is pinned in `Dockerfile` as `CODEX_VERSION`. The worker builds a fixed command line, and Codex renames
 flags often enough that following `latest` would eventually break every job at
 once.
 

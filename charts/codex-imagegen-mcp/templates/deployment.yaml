@@ -1,32 +1,32 @@
-{{- if .Values.split }}
 {{/*
-Only exists in the split layout. It holds the ChatGPT sign-in, which is why
-it stays at one replica: a second pod would need its own sign-in, and two
-Codex processes sharing one token file is worse than a queue that drains
-slightly slower.
+The main Deployment. Without split it runs both roles in one process; with
+split it is the MCP endpoint only.
 */}}
+{{- $role := ternary "mcp" "all" .Values.split -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "codex-imagegen-mcp.fullname" . }}-worker
+  name: {{ include "codex-imagegen-mcp.fullname" . }}
   labels:
     {{- include "codex-imagegen-mcp.labels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
+    app.kubernetes.io/component: {{ $role }}
 spec:
-  replicas: 1
-  {{- if .Values.persistence.codexHome.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- if and (not .Values.split) .Values.persistence.codexHome.enabled }}
+  # This pod holds ReadWriteOnce volumes, so the old pod has to let go
+  # before the new one can start. A rolling update would deadlock on them.
   strategy:
     type: Recreate
   {{- end }}
   selector:
     matchLabels:
       {{- include "codex-imagegen-mcp.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: worker
+      app.kubernetes.io/component: {{ $role }}
   template:
     metadata:
       labels:
         {{- include "codex-imagegen-mcp.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: worker
+        app.kubernetes.io/component: {{ $role }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -53,32 +53,44 @@ spec:
               containerPort: 8080
               protocol: TCP
           env:
-            {{- include "codex-imagegen-mcp.env" (list . "worker") | nindent 12 }}
+            {{- include "codex-imagegen-mcp.env" (list . $role) | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /health/live
               port: http
-            initialDelaySeconds: 15
+            initialDelaySeconds: 10
             periodSeconds: 20
           readinessProbe:
+            # Reports not-ready while a dependency is unreachable, and while
+            # the Codex sign-in is missing, so an unusable pod leaves the
+            # Service rather than failing every call.
             httpGet:
               path: /health/ready
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
           resources:
-            {{- toYaml .Values.worker.resources | nindent 12 }}
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if not .Values.split }}
           volumeMounts:
             - name: codex-home
               mountPath: /home/codex/.codex
             - name: work
               mountPath: /work/jobs
+            {{- if not .Values.s3.endpoint }}
+            - name: artifacts
+              mountPath: /data/artifacts
+            {{- end }}
+          {{- end }}
+      {{- if not .Values.split }}
       volumes:
         - name: codex-home
           {{- if .Values.persistence.codexHome.enabled }}
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.codexHome.existingClaim | default (printf "%s-codex-home" (include "codex-imagegen-mcp.fullname" .)) }}
           {{- else }}
+          # No volume means the sign-in is lost on every restart. Only
+          # sensible for a throwaway test.
           emptyDir: {}
           {{- end }}
         - name: work
@@ -88,6 +100,17 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if not .Values.s3.endpoint }}
+        - name: artifacts
+          {{- if .Values.persistence.artifacts.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.artifacts.existingClaim | default (printf "%s-artifacts" (include "codex-imagegen-mcp.fullname" .)) }}
+          {{- else }}
+          # Every image URL already handed out dies with the pod.
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -100,4 +123,7 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-{{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

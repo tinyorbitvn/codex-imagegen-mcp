@@ -1,40 +1,47 @@
 # Architecture
 
-Two services, one queue, one bucket.
+One process by default. Two roles inside it, which can be pulled apart when a
+deployment outgrows one pod.
 
 ```
 MCP client (Claude Design, Claude Code, any MCP client)
         |  Streamable HTTP, POST /mcp
         v
-  imagegen-mcp  ------ enqueue ------>  Redis
-        ^                                 |
-        |  poll job state                 | dequeue
-        |                                 v
-        +---------------------------  codex-image-worker
-                                           |  runs `codex exec`
-                                           v
-                                     ChatGPT / Codex
-                                           |
-                                           v
-                                   S3 bucket -> image URL
++---------------------------------------------------+
+|  codex-imagegen-mcp                                |
+|                                                    |
+|   MCP role  --enqueue-->  queue  --dequeue-->  worker role
+|                        (memory or Redis)           |   runs `codex exec`
+|                                                    |   v
+|   GET /artifacts/<key>  <----------------  store   |  ChatGPT / Codex
+|                        (local dir or S3)           |
++---------------------------------------------------+
 ```
 
-## Why it is split in two
+## Why one process is the default
 
-The MCP server never touches credentials. It parses the call, validates it,
-puts a job on the queue and reports progress. The worker is the only process
-that runs Codex, and the only one with the ChatGPT session on a volume.
+Every extra moving part is something a new user has to install, secure and
+keep running before they can generate a single image. A queue and an object
+store earn their place at scale, not on a laptop. So both have a local
+implementation: an in-process queue, and a directory served over the same HTTP
+port. `docker compose up -d` is the whole installation.
 
-That split is what makes the MCP endpoint safe to scale and to expose
-internally: a compromised or busy MCP replica has nothing to steal. It also
-means the expensive part, one Codex process at a time, is a separate scaling
-decision from the cheap part.
+## Why the roles still exist
 
-## Why a queue instead of a direct call
+Splitting is worth it when you want to restart or scale the MCP endpoint
+without touching the process that holds the ChatGPT session, or when you want
+the endpoint reachable from a network that the Codex process is kept off.
 
-An image takes 30 to 140 seconds. A single Codex sign-in runs one job at a
-time. Without a queue, a second caller would either block an HTTP connection
-for two minutes or get a failure; with one, callers get a job id immediately
+`ROLE` selects: `all` (default), `mcp`, `worker`. The image is the same in all
+three cases. Splitting requires `REDIS_URL` and the `S3_*` variables, because
+two processes share neither memory nor a local disk, and the configuration
+refuses the combinations that cannot work rather than failing later.
+
+## Why a queue at all
+
+An image takes 30 to 140 seconds, and a single Codex sign-in runs one job at a
+time. Without a queue, a second caller would either hold an HTTP connection
+open for two minutes or be refused. With one, callers get a job id immediately
 and the worker drains the backlog at whatever rate the account allows.
 
 The queue also gives cancellation and progress a place to live. `create_image`
@@ -58,35 +65,45 @@ combined scene cannot be cut into layers afterwards.
 
 Style profiles let a caller send `style.reference: "tinyorbit-cloud-v1"`
 instead of repeating a paragraph of style description on every call. Profiles
-live in `packages/contracts/src/styles.ts`; add your own there.
+live in `src/contracts/styles.ts`; add your own there.
 
 ## Transport
 
 MCP Streamable HTTP in session-less mode: every call is a self-contained
 `POST /mcp`. `GET /mcp` and `DELETE /mcp`, the session-based part of the
 protocol, deliberately return an error. Being stateless is what lets the MCP
-server run several replicas behind one address with no sticky sessions.
+role run several replicas behind one address with no sticky sessions.
 
-Both services also serve `/health/live`, `/health/ready` and `/metrics`
-(Prometheus text format).
+The same server also exposes `/health/live`, `/health/ready`, `/metrics` in
+Prometheus text format, and `/artifacts/<key>` when images are stored locally.
 
 ## Where the image actually comes from
 
 The worker shells out to the official Codex CLI, pinned to an exact version,
 with `exec --skip-git-repo-check`. It does not call any private endpoint. The
 environment handed to that process is an allowlist, so an `OPENAI_API_KEY` set
-on the pod is never forwarded: the point of the project is to spend the
-subscription, not the API balance.
+on the host is never forwarded: the point is to spend the subscription, not
+the API balance.
+
+The prompt sent to Codex is written by the worker, not by the caller. User
+text only ever lands in predefined slots. Codex is a coding agent, so passing
+a caller's string straight through as the prompt would hand them the ability
+to make it read files or run commands. Every instruction about the filesystem
+comes from the worker, and the caller can never choose the output path.
 
 Codex writes the generated image into the job's working directory. The worker
-uploads it to S3 and returns `S3_PUBLIC_BASE_URL` plus the object key. Codex
-also keeps its own copy under `$CODEX_HOME/generated_images`, about 0.7 MB per
-job, which the worker prunes on a retention window because nothing else will.
+uploads it to the store and returns the public URL. Codex also keeps its own
+copy under `$CODEX_HOME/generated_images`, about 0.7 MB per job, which the
+worker prunes on a retention window because nothing else will.
 
-## Packages
+## Source layout
 
-| Package | Contents |
+| Path | Contents |
 |---|---|
-| `packages/contracts` | Job and artifact types, error codes, log redaction, style profiles. Shared by both services so their view of a job cannot drift. |
-| `packages/job-queue` | Queue interface with a Redis implementation and an in-memory one used by the tests. |
-| `packages/artifact-storage` | S3 upload, public URL construction, presigned URLs. |
+| `src/index.ts` | The only entrypoint. Reads the role, builds the queue and the store, assembles one HTTP server. |
+| `src/config.ts` | Every environment variable, and the rules that pick a queue and a store. |
+| `src/contracts/` | Job and artifact types, error codes, log redaction, style profiles. |
+| `src/queue/` | Queue interface, in-memory implementation, Redis implementation. |
+| `src/storage/` | Store interface, local directory implementation, S3 implementation. |
+| `src/mcp/` | Tool registration, transport, and the service behind the tools. |
+| `src/worker/` | The consumer loop, the Codex runner, prompt building, image inspection, metrics. |

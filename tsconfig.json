@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "types": ["node"],
+    "outDir": "dist",
+    "rootDir": "src",
+
+    // Internal imports keep the ".ts" extension ON PURPOSE: tests run straight
+    // off the source files with `node --test --experimental-strip-types`, and
+    // Node's strip-types loader does NOT resolve a missing extension for you.
+    // The three flags below allow that while still emitting JS that runs in
+    // production (tsc rewrites .ts -> .js on the way out).
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src/**/*"]
+}

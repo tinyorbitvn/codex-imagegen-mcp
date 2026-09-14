@@ -1,113 +1,70 @@
 # Default values for codex-imagegen-mcp.
 #
-# The two things you MUST provide are object storage (s3.*) and, unless you
-# let the chart run one for you, a Redis URL. Everything else has a working
-# default.
+# The defaults run ONE pod that serves MCP and generates images, keeping its
+# queue in memory and its images on a volume. Nothing else has to exist in
+# the cluster. Set redis.* and s3.* to move those out, and split=true to run
+# the MCP endpoint and the worker as separate Deployments.
 #
 # After installing, the Codex sign-in still has to be seeded by hand once:
-# the images contain no credentials. See docs/codex-authentication.md.
+# no image ships with credentials. See docs/codex-authentication.md.
 
 nameOverride: ""
 fullnameOverride: ""
+
+image:
+  registry: ghcr.io
+  repository: tinyorbitvn/codex-imagegen-mcp
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
 
 serviceAccount:
   create: true
   name: ""
   annotations: {}
 
-imagePullSecrets: []
+# false: one Deployment running both roles in one process.
+# true:  two Deployments, one serving MCP and one running Codex. That needs a
+#        shared queue and shared object storage, since separate processes
+#        share neither memory nor a local disk, so it requires redis and s3
+#        below. Use it when you want to scale or restart the endpoint without
+#        touching the process that holds the ChatGPT session.
+split: false
 
-# ---------------------------------------------------------------------------
-# MCP server: the endpoint your MCP client talks to. Stateless, so it scales
-# horizontally.
-# ---------------------------------------------------------------------------
-mcp:
-  replicaCount: 2
-  image:
-    registry: ghcr.io
-    repository: tinyorbitvn/imagegen-mcp
-    # Defaults to the chart's appVersion.
-    tag: ""
-    pullPolicy: IfNotPresent
+# Replicas for the MCP endpoint. Stateless, so raise it freely. Ignored for
+# the worker, which stays at one because one sign-in drives one Codex
+# process.
+replicaCount: 1
 
-  # How many jobs may be waiting before create_image starts refusing work.
-  queueLimit: 64
-  # Per-caller hourly limits. The caller is taken from the
-  # x-agentgateway-principal, x-jwt-sub or x-user header, in that order, and
-  # falls back to "anonymous" — so behind an unauthenticated ingress every
-  # caller shares one bucket.
-  rateLimit:
-    createImagePerHour: 10
-    editImagePerHour: 20
+# The URL clients are handed for a generated image. It has to resolve from
+# wherever the client runs. Left empty, it is taken from the ingress host
+# when one is enabled, and otherwise from the in-cluster Service name, which
+# only works for clients inside the cluster.
+publicBaseUrl: ""
 
-  service:
-    type: ClusterIP
-    port: 80
-    annotations: {}
+# Jobs allowed to be waiting before new work is rejected.
+queueLimit: 64
 
-  resources:
-    requests:
-      cpu: 50m
-      memory: 128Mi
-    limits:
-      memory: 512Mi
+# Per-caller hourly limits. The caller comes from the
+# x-agentgateway-principal, x-jwt-sub or x-user header, in that order, and
+# falls back to "anonymous" — so behind an unauthenticated ingress every
+# caller shares one bucket.
+rateLimit:
+  createImagePerHour: 10
+  editImagePerHour: 20
 
-  podAnnotations: {}
-  podLabels: {}
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
-  topologySpreadConstraints: []
-
-# ---------------------------------------------------------------------------
-# Worker: runs the Codex CLI. Holds the ChatGPT session, so it is the only
-# part that has credentials.
-# ---------------------------------------------------------------------------
 worker:
-  # Keep this at 1 unless you have seeded a separate Codex sign-in per
-  # replica. Replicas share one queue but NOT one credential file, and a
-  # single ChatGPT session driving parallel Codex runs gets rejected.
-  replicaCount: 1
-  image:
-    registry: ghcr.io
-    repository: tinyorbitvn/codex-image-worker
-    tag: ""
-    pullPolicy: IfNotPresent
-
-  # Jobs run one at a time per replica, for the same reason.
+  # Jobs at once. One ChatGPT sign-in drives one Codex process; raise this
+  # only if you know the account tolerates more.
   concurrency: 1
-  # A job is given up on after this long. Real jobs take 30-140 seconds;
-  # the generous default covers a queue of prompts behind a slow account.
+  # A job is given up on after this long. Real jobs take 30 to 140 seconds.
   jobTimeoutSeconds: 900
   # Codex always leaves its own copy of every generated image in
-  # $CODEX_HOME/generated_images, even on success. Measured at roughly
-  # 0.7 MB per job, so the directory grows without bound on the volume.
-  # The worker deletes copies older than this.
+  # $CODEX_HOME/generated_images, even on success, at roughly 0.7 MB per job.
+  # Copies older than this are deleted. Nothing else cleans them up.
   generatedImageRetentionHours: 24
-
-  persistence:
-    # The Codex sign-in. This MUST survive restarts, or every restart means
-    # signing in again.
-    codexHome:
-      enabled: true
-      existingClaim: ""
-      storageClass: ""
-      accessModes: ["ReadWriteOnce"]
-      size: 1Gi
-    # Scratch space for in-flight jobs. Safe to lose, so an emptyDir is the
-    # default; give it a claim if your nodes have small ephemeral disks.
-    work:
-      enabled: false
-      existingClaim: ""
-      storageClass: ""
-      accessModes: ["ReadWriteOnce"]
-      size: 5Gi
-
-  service:
-    type: ClusterIP
-    port: 80
-    annotations: {}
-
   resources:
     requests:
       cpu: 100m
@@ -115,22 +72,51 @@ worker:
     limits:
       memory: 1Gi
 
-  podAnnotations: {}
-  podLabels: {}
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
 
-# ---------------------------------------------------------------------------
-# Queue
-# ---------------------------------------------------------------------------
+persistence:
+  # The Codex sign-in. This MUST survive restarts, or every restart means
+  # signing in again.
+  codexHome:
+    enabled: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes: ["ReadWriteOnce"]
+    size: 1Gi
+  # Generated images, when no object storage is configured. Losing this
+  # volume means every URL already handed to a client stops working.
+  artifacts:
+    enabled: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes: ["ReadWriteOnce"]
+    size: 10Gi
+  # Scratch space for jobs in flight. Safe to lose, so an emptyDir by
+  # default; give it a claim if your nodes have small ephemeral disks.
+  work:
+    enabled: false
+    existingClaim: ""
+    storageClass: ""
+    accessModes: ["ReadWriteOnce"]
+    size: 5Gi
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
 redis:
   # Point this at your own Redis, e.g. redis://redis-master.redis:6379.
-  # Leave it empty and set deploy=true to get the throwaway one below.
+  # Leave both empty to keep the queue inside the process, which is fine
+  # while split is false.
   url: ""
-  # A single in-chart Redis pod with NO persistence. It exists so a first
-  # install works with nothing else in the cluster. Anything you care about
-  # deserves a real Redis.
+  # A single in-chart Redis pod with NO persistence, for trying the split
+  # layout without standing up a real one.
   deploy: false
   image:
     registry: docker.io
@@ -144,44 +130,36 @@ redis:
     limits:
       memory: 256Mi
 
-# ---------------------------------------------------------------------------
-# Object storage for the generated images. Required.
-# ---------------------------------------------------------------------------
+# Object storage. Leave endpoint empty to store images on the artifacts
+# volume and serve them from /artifacts on the same port.
 s3:
-  # S3 API endpoint, e.g. https://s3.example.com or http://minio.minio:9000.
   endpoint: ""
   bucket: ""
   region: us-east-1
   # Path-style addressing (bucket in the path, not the hostname). Keep this
   # true for MinIO, Ceph RGW and most self-hosted gateways: they rarely have
-  # the wildcard DNS that virtual-hosted style needs. AWS S3 itself works
-  # either way.
+  # the wildcard DNS that virtual-hosted style needs.
   forcePathStyle: true
-  # Base URL handed back to MCP clients, without a trailing slash. The final
-  # link is publicBaseUrl + "/" + object key, an unsigned GET, so the bucket
-  # must allow anonymous download. Point it at a CDN or public bucket URL.
+  # Base URL clients are handed, without a trailing slash. The final link is
+  # this plus "/" plus the object key, an unsigned GET, so the bucket must
+  # allow anonymous download.
   publicBaseUrl: ""
   signedUrlTtlSeconds: 86400
-  # Credentials. Either name a Secret you already have, or let the chart
-  # create one from the two values below.
-  # The Secret must hold keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+  # Either name a Secret holding AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY,
+  # or let the chart create one from the two values below.
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""
 
-# ---------------------------------------------------------------------------
-# Tracing. Empty endpoint disables OpenTelemetry export entirely.
-# ---------------------------------------------------------------------------
+# Empty endpoint disables OpenTelemetry export entirely.
 otlp:
   endpoint: ""
 
-# ---------------------------------------------------------------------------
 # Ingress for the MCP endpoint.
 #
-# The service has NO authentication of its own. Anything that can reach
-# /mcp can spend your ChatGPT quota, so put an authenticating proxy in
-# front of it before exposing it beyond the cluster.
-# ---------------------------------------------------------------------------
+# The service has NO authentication of its own. Anything that can reach /mcp
+# can spend your ChatGPT quota, so put an authenticating proxy in front
+# before exposing it beyond the cluster.
 ingress:
   enabled: false
   className: ""
@@ -193,9 +171,16 @@ ingress:
           pathType: Prefix
   tls: []
 
-# Applied to both Deployments. The images run as UID 10001 and the Codex
-# volume is written as that user; changing this without changing the image
-# will make the worker unable to write its own sign-in.
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# The image runs as UID 10001 and the volumes are written as that user;
+# changing this without changing the image stops the process writing its own
+# sign-in.
 podSecurityContext:
   runAsUser: 10001
   runAsGroup: 10001

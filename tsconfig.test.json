@@ -1,0 +1,11 @@
+{
+  // Tests are never emitted, they run from source. This config exists so the
+  // typechecker still sees them; without it a test could drift from the code
+  // it tests and nothing would say so until the test ran.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}

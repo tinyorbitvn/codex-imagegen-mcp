@@ -1,149 +1,65 @@
 # Quick-start stack for codex-imagegen-mcp.
 #
-#   cp .env.example .env      # then edit if you want
+#   cp .env.example .env      # optional, every value has a default
 #   docker compose up -d
-#   docker compose run --rm codex-login       # one-time Codex sign-in
+#   docker compose exec codex-imagegen-mcp codex login --device-auth
+#   docker compose restart codex-imagegen-mcp
 #
-# What this brings up:
-#   redis   - the job queue between the MCP server and the worker
-#   minio   - S3-compatible storage for the generated images
-#   imagegen-mcp        - the MCP endpoint your client connects to
-#   codex-image-worker  - runs the Codex CLI and produces the images
+# One container. No Redis and no object storage: with neither configured the
+# process keeps its queue in memory and writes images to a volume, serving
+# them from the same port it serves MCP on.
 #
-# This is a SINGLE-MACHINE evaluation stack. It has no TLS, no
-# authentication in front of the MCP endpoint, and it publishes the MinIO
-# bucket for anonymous download so returned image URLs open in a browser.
-# Do not put it on a public address as-is; see docs/deployment-kubernetes.md
-# for a production shape.
+# That is a single-machine evaluation stack. It has no TLS and no
+# authentication in front of the MCP endpoint, and anything that can reach
+# the port can spend your ChatGPT quota. Do not put it on a public address
+# as-is; docs/deployment-kubernetes.md describes a production shape.
+#
+# To use a real queue and real object storage, set REDIS_URL and the S3_*
+# variables in .env. Nothing else changes.
 
 name: codex-imagegen-mcp
 
 services:
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    restart: unless-stopped
-
-  minio:
-    # quay.io, not Docker Hub: MinIO's Docker Hub repositories are gone, and a
-    # `minio/minio` reference now fails with "repository does not exist"
-    # (checked 2026-09-14).
-    image: quay.io/minio/minio:latest
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
-    ports:
-      # 9000 is the S3 API. It is published because the image URLs handed
-      # back to the MCP client point here, and your browser has to be able
-      # to open them from outside the compose network.
-      - "${S3_PORT:-9000}:9000"
-      # 9001 is the MinIO web console. Handy while evaluating; drop it if
-      # you do not want it reachable.
-      - "${S3_CONSOLE_PORT:-9001}:9001"
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    restart: unless-stopped
-
-  # Creates the bucket and makes it readable without credentials, then
-  # exits. The worker writes objects here; the URL it returns is
-  # S3_PUBLIC_BASE_URL + "/" + key, a plain unsigned GET, so the bucket has
-  # to allow anonymous download for those links to work.
-  minio-setup:
-    image: quay.io/minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      S3_BUCKET: ${S3_BUCKET:-tinyorbit-artifacts}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        set -e
-        mc alias set local http://minio:9000 "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"
-        mc mb --ignore-existing "local/$$S3_BUCKET"
-        mc anonymous set download "local/$$S3_BUCKET"
-        echo "bucket $$S3_BUCKET ready"
-    restart: "no"
-
-  imagegen-mcp:
-    image: ghcr.io/tinyorbitvn/imagegen-mcp:${IMAGE_TAG:-latest}
+  codex-imagegen-mcp:
+    image: ghcr.io/tinyorbitvn/codex-imagegen-mcp:${IMAGE_TAG:-latest}
     build:
       context: .
-      dockerfile: services/imagegen-mcp/Dockerfile
-    depends_on:
-      redis:
-        condition: service_healthy
     environment:
+      # all = MCP endpoint and image worker in one process.
+      ROLE: ${ROLE:-all}
       PORT: "8080"
-      REDIS_URL: redis://redis:6379
-      QUEUE_LIMIT: ${QUEUE_LIMIT:-64}
-      RATE_LIMIT_CREATE_IMAGE_PER_HOUR: ${RATE_LIMIT_CREATE_IMAGE_PER_HOUR:-10}
-      RATE_LIMIT_EDIT_IMAGE_PER_HOUR: ${RATE_LIMIT_EDIT_IMAGE_PER_HOUR:-20}
-    ports:
-      - "${MCP_PORT:-8080}:8080"
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:8080/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    restart: unless-stopped
-
-  codex-image-worker:
-    image: ghcr.io/tinyorbitvn/codex-image-worker:${IMAGE_TAG:-latest}
-    build:
-      context: .
-      dockerfile: services/codex-image-worker/Dockerfile
-    depends_on:
-      redis:
-        condition: service_healthy
-      minio-setup:
-        condition: service_completed_successfully
-    environment:
-      PORT: "8080"
-      REDIS_URL: redis://redis:6379
-      QUEUE_LIMIT: ${QUEUE_LIMIT:-64}
+      # The URL the MCP client is handed for a generated image. It has to
+      # resolve from OUTSIDE this container, so it names the published port.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      # Empty = keep the queue in memory. Point it at a Redis to share work
+      # between separate mcp and worker deployments.
+      REDIS_URL: ${REDIS_URL:-}
+      # Empty = store images on the artifacts volume below and serve them
+      # from /artifacts. Set the S3_* block to use object storage instead.
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       # One Codex sign-in means one Codex process. Raising this runs several
       # jobs through the same account at once, which the account may reject.
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-900}
       GENERATED_IMAGE_RETENTION_HOURS: ${GENERATED_IMAGE_RETENTION_HOURS:-24}
-      S3_ENDPOINT: http://minio:9000
-      S3_BUCKET: ${S3_BUCKET:-tinyorbit-artifacts}
-      S3_REGION: ${S3_REGION:-us-east-1}
-      # MinIO is addressed by container name, which has no wildcard DNS, so
-      # the bucket has to go in the path rather than the hostname.
-      S3_FORCE_PATH_STYLE: "true"
-      # The URL the MCP client is handed. It must resolve from OUTSIDE the
-      # compose network, so it names the published port, not "minio".
-      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-http://localhost:9000/tinyorbit-artifacts}
-      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-minioadmin}
-      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-minioadmin}
+      QUEUE_LIMIT: ${QUEUE_LIMIT:-64}
+      RATE_LIMIT_CREATE_IMAGE_PER_HOUR: ${RATE_LIMIT_CREATE_IMAGE_PER_HOUR:-10}
+      RATE_LIMIT_EDIT_IMAGE_PER_HOUR: ${RATE_LIMIT_EDIT_IMAGE_PER_HOUR:-20}
+    ports:
+      - "${MCP_PORT:-8080}:8080"
     volumes:
-      # The Codex sign-in lives here and must survive restarts. Nothing in
-      # the image holds credentials.
+      # The Codex sign-in. Nothing in the image holds credentials, and losing
+      # this volume means signing in again.
       - codex-home:/home/codex/.codex
-      - worker-work:/work/jobs
+      # Generated images, when no object storage is configured.
+      - artifacts:/data/artifacts
+      - work:/work/jobs
     healthcheck:
       test:
         - CMD
@@ -156,26 +72,7 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # One-time helper: `docker compose run --rm codex-login`.
-  # Signs in to ChatGPT against the SAME volume the worker reads, so the
-  # session lands where the worker looks for it. It sits in a profile, so a
-  # plain `docker compose up` never starts it.
-  #
-  # --device-auth prints a code to paste into a browser on any machine,
-  # which is what you want when the container has no browser of its own.
-  # Verified against codex-cli 0.154.0. If your Codex build lacks the flag,
-  # drop it and publish port 1455 instead; see docs/codex-authentication.md.
-  codex-login:
-    image: ghcr.io/tinyorbitvn/codex-image-worker:${IMAGE_TAG:-latest}
-    profiles: ["login"]
-    entrypoint: ["codex", "login", "--device-auth"]
-    stdin_open: true
-    tty: true
-    volumes:
-      - codex-home:/home/codex/.codex
-
 volumes:
-  redis-data:
-  minio-data:
   codex-home:
-  worker-work:
+  artifacts:
+  work:

@@ -3,26 +3,31 @@ Fail early, with a sentence that says what to do, rather than letting the
 pods crash-loop on a missing environment variable.
 This file renders nothing.
 */}}
-{{- if not .Values.s3.endpoint }}
-{{- fail "s3.endpoint is required: the worker has nowhere to put generated images. Example: --set s3.endpoint=http://minio.minio:9000" }}
-{{- end }}
-{{- if not .Values.s3.bucket }}
-{{- fail "s3.bucket is required. Create the bucket first; the chart does not create it." }}
-{{- end }}
-{{- if not .Values.s3.publicBaseUrl }}
-{{- fail "s3.publicBaseUrl is required: it is the URL handed back to MCP clients, e.g. https://s3.example.com/my-bucket" }}
-{{- end }}
-{{- if and (not .Values.s3.existingSecret) (not .Values.s3.accessKeyId) }}
-{{- fail "Object storage credentials are missing: set s3.existingSecret, or s3.accessKeyId and s3.secretAccessKey" }}
-{{- end }}
+{{- if .Values.split }}
 {{- if and (not .Values.redis.url) (not .Values.redis.deploy) }}
-{{- fail "No queue: set redis.url to your own Redis, or redis.deploy=true for a throwaway one" }}
+{{- fail "split=true runs two processes, which cannot share an in-process queue. Set redis.url to your own Redis, or redis.deploy=true for a throwaway one." }}
+{{- end }}
+{{- if not .Values.s3.endpoint }}
+{{- fail "split=true needs object storage both Deployments can reach: the worker writes the image and the MCP pod hands out its URL. Set s3.endpoint, s3.bucket and s3.publicBaseUrl, or leave split=false." }}
+{{- end }}
 {{- end }}
 {{- if and .Values.redis.url .Values.redis.deploy }}
 {{- fail "redis.url and redis.deploy are both set; pick one" }}
 {{- end }}
-{{- if gt (int .Values.worker.replicaCount) 1 }}
-{{- if not .Values.worker.persistence.codexHome.existingClaim }}
-{{- fail "worker.replicaCount > 1 needs one Codex sign-in per replica. Give each replica its own claim (worker.persistence.codexHome.existingClaim) and install the chart once per replica, or keep replicaCount at 1." }}
+{{- if .Values.s3.endpoint }}
+{{- if not .Values.s3.bucket }}
+{{- fail "s3.bucket is required when s3.endpoint is set. Create the bucket first; the chart does not create it." }}
 {{- end }}
+{{- if not .Values.s3.publicBaseUrl }}
+{{- fail "s3.publicBaseUrl is required when s3.endpoint is set: it is the URL handed back to MCP clients, e.g. https://s3.example.com/my-bucket" }}
+{{- end }}
+{{- if and (not .Values.s3.existingSecret) (not .Values.s3.accessKeyId) }}
+{{- fail "Object storage credentials are missing: set s3.existingSecret, or s3.accessKeyId and s3.secretAccessKey" }}
+{{- end }}
+{{- end }}
+{{- if and (not .Values.s3.endpoint) (not .Values.publicBaseUrl) (not .Values.ingress.enabled) }}
+{{- fail "Images will be served from this release's own /artifacts path, so clients need a URL that resolves for them. Set publicBaseUrl, or enable the ingress, or use object storage. Without one of those, only clients inside the cluster can open a generated image." }}
+{{- end }}
+{{- if and (not .Values.split) (gt (int .Values.replicaCount) 1) }}
+{{- fail "replicaCount > 1 without split means several pods each holding their own queue and their own Codex sign-in. Set split=true to scale the MCP endpoint, or keep replicaCount at 1." }}
 {{- end }}

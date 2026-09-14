@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codex-imagegen-mcp.fullname" . }}
+  labels:
+    {{- include "codex-imagegen-mcp.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "codex-imagegen-mcp.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ ternary "mcp" "all" .Values.split }}
+{{- if .Values.split }}
+---
+{{/*
+The worker takes no client traffic. This Service exists so probes,
+dashboards and a Prometheus scrape have a stable address for /metrics.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codex-imagegen-mcp.fullname" . }}-worker
+  labels:
+    {{- include "codex-imagegen-mcp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "codex-imagegen-mcp.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+{{- end }}

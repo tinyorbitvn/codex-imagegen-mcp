@@ -1,0 +1,62 @@
+{{- $full := include "codex-imagegen-mcp.fullname" . -}}
+{{- if and .Values.persistence.codexHome.enabled (not .Values.persistence.codexHome.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $full }}-codex-home
+  labels:
+    {{- include "codex-imagegen-mcp.labels" . | nindent 4 }}
+  annotations:
+    # Keep the sign-in when the release is uninstalled. Deleting it means
+    # signing in to ChatGPT again by hand.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.codexHome.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.codexHome.size }}
+  {{- with .Values.persistence.codexHome.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- if and (not .Values.s3.endpoint) (not .Values.split) .Values.persistence.artifacts.enabled (not .Values.persistence.artifacts.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $full }}-artifacts
+  labels:
+    {{- include "codex-imagegen-mcp.labels" . | nindent 4 }}
+  annotations:
+    # Every image URL already handed to a client points here. Deleting this
+    # breaks links that clients may still be holding.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.artifacts.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.artifacts.size }}
+  {{- with .Values.persistence.artifacts.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- if and .Values.persistence.work.enabled (not .Values.persistence.work.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $full }}-work
+  labels:
+    {{- include "codex-imagegen-mcp.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.work.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.work.size }}
+  {{- with .Values.persistence.work.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
