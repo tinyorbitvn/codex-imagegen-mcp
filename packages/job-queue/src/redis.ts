@@ -1,19 +1,20 @@
-// Cài đặt JobStore + JobQueue trên Redis.
+// Redis implementation of JobStore + JobQueue.
 //
-// Bố cục khoá:
-//   job:<jobId>                 STRING(JSON)  bản ghi job
-//   queue:imagegen              LIST          việc đang chờ (FIFO)
-//   queue:imagegen:processing   LIST          việc đã lấy, chưa ack
-//   cancel:<jobId>              STRING        cờ huỷ
-//   artifact:<proj>:<asset>     ZSET          version -> jobId (mọi job chưa fail)
-//   done:<proj>:<asset>         ZSET          version -> jobId (chỉ job completed)
-//   principal:<name>            ZSET          thời điểm -> jobId (rate limit)
+// Key layout:
+//   job:<jobId>                 STRING(JSON)  job record
+//   queue:imagegen              LIST          pending work (FIFO)
+//   queue:imagegen:processing   LIST          claimed work, not yet acked
+//   cancel:<jobId>              STRING        cancellation flag
+//   artifact:<proj>:<asset>     ZSET          version -> jobId (every non-failed job)
+//   done:<proj>:<asset>         ZSET          version -> jobId (completed jobs only)
+//   principal:<name>            ZSET          timestamp -> jobId (rate limiting)
 //
-// *** VÌ SAO DÙNG BRPOPLPUSH CHỨ KHÔNG PHẢI BRPOP ***
-// BRPOP lấy việc ra khỏi hàng đợi là mất dấu: worker chết giữa chừng
-// thì việc biến mất và job treo ở "queued" mãi. BRPOPLPUSH chuyển
-// nguyên tử sang danh sách `processing`, nên còn dấu vết để dọn.
-// `reapStale()` lúc worker khởi động lại đọc danh sách đó.
+// *** WHY BRPOPLPUSH INSTEAD OF BRPOP ***
+// BRPOP removes work from the queue and loses track of it: if the worker
+// dies mid-job, the work vanishes and the job hangs at "queued" forever.
+// BRPOPLPUSH atomically moves it into the `processing` list, leaving a
+// trace to clean up. `reapStale()` reads that list when the worker
+// restarts.
 
 import { Redis } from "ioredis";
 import { ImagegenError } from "@tinyorbit/contracts";
@@ -23,19 +24,20 @@ import type { JobQueue, JobStore } from "./types.ts";
 const QUEUE = "queue:imagegen";
 const PROCESSING = "queue:imagegen:processing";
 
-/** Job giữ 30 ngày rồi tự hết hạn — đủ lâu để tra cứu, không phình mãi. */
+/** Jobs are kept for 30 days and then expire on their own — long enough to look up, without growing forever. */
 const JOB_TTL_SECONDS = 30 * 24 * 3600;
 
 export interface RedisOptions {
   url: string;
-  /** Trần số việc đang chờ. Vượt thì từ chối NGAY thay vì xếp hàng vô hạn. */
+  /** Cap on pending jobs. Exceeding it means an IMMEDIATE rejection instead of queueing without limit. */
   queueLimit: number;
 }
 
 function connect(url: string): Redis {
   return new Redis(url, {
-    // Thử lại có trần: Redis chớp nháy thì tự nối lại, nhưng Redis chết
-    // hẳn thì lỗi phải nổi lên chứ không treo request MCP vô thời hạn.
+    // Bounded retries: a Redis blip reconnects on its own, but a Redis
+    // that's actually down must surface as an error instead of hanging an
+    // MCP request indefinitely.
     maxRetriesPerRequest: 3,
     retryStrategy: (times) => Math.min(times * 200, 2000),
     enableReadyCheck: true,
@@ -56,11 +58,12 @@ export class RedisJobStore implements JobStore {
   async create(job: JobRecord): Promise<void> {
     const m = this.#r.multi();
     m.set(`job:${job.jobId}`, JSON.stringify(job), "EX", JOB_TTL_SECONDS);
-    // Ghi vào chỉ mục "đã cấp phát" NGAY lúc tạo, trước khi job chạy —
-    // đó là điều khiến hai job song song không cùng nhận một version.
+    // Write to the "allocated" index RIGHT AT creation, before the job
+    // runs — that's what keeps two parallel jobs from being handed the
+    // same version.
     m.zadd(`artifact:${job.projectId}:${job.assetId}`, job.version, job.jobId);
     m.zadd(`principal:${job.principal}`, Date.now(), job.jobId);
-    // Dọn mốc rate limit cũ hơn 24h để ZSET không phình vô hạn.
+    // Clean up rate-limit entries older than 24h so the ZSET doesn't grow without bound.
     m.zremrangebyscore(`principal:${job.principal}`, 0, Date.now() - 24 * 3600_000);
     await m.exec();
   }
@@ -105,8 +108,8 @@ export class RedisJobStore implements JobStore {
 
   async markFailed(jobId: string, code: string, message: string): Promise<void> {
     await this.#update(jobId, (j) =>
-      // Job đã ở trạng thái cuối thì KHÔNG ghi đè: một lượt dọn dẹp muộn
-      // không được biến job thành công thành thất bại.
+      // A job already in a terminal state is NEVER overwritten: a late
+      // cleanup pass must not turn a successful job into a failed one.
       j.status === "completed" || j.status === "cancelled"
         ? null
         : {
@@ -117,7 +120,7 @@ export class RedisJobStore implements JobStore {
             errorMessage: message,
           },
     );
-    // Trả lại số phiên bản cho lần sau: job hỏng không được chiếm chỗ.
+    // Give the version number back for next time: a broken job must not hold a slot.
     const job = await this.get(jobId);
     if (job) {
       await this.#r.zrem(`artifact:${job.projectId}:${job.assetId}`, jobId);
@@ -171,8 +174,9 @@ export class RedisJobStore implements JobStore {
 
 export class RedisJobQueue implements JobQueue {
   #r: Redis;
-  /** Kết nối RIÊNG cho lệnh chặn: BRPOPLPUSH giữ kết nối, dùng chung
-   *  một kết nối sẽ làm mọi lệnh khác xếp hàng sau nó. */
+  /** DEDICATED connection for the blocking command: BRPOPLPUSH holds the
+   *  connection, so sharing one connection would queue every other
+   *  command behind it. */
   #blocking: Redis;
   #limit: number;
 
@@ -187,23 +191,25 @@ export class RedisJobQueue implements JobQueue {
     if (depth >= this.#limit) {
       throw new ImagegenError(
         "RATE_LIMITED",
-        `Hàng đợi đã đầy (${this.#limit} việc đang chờ). Thử lại sau.`,
+        `Queue is full (${this.#limit} jobs pending). Try again later.`,
       );
     }
     await this.#r.lpush(QUEUE, JSON.stringify(payload));
   }
 
   async dequeue(timeoutMs: number): Promise<JobPayload | null> {
-    // ioredis nhận timeout theo GIÂY; 0 nghĩa là chờ mãi nên phải chặn
-    // dưới ở 1 để vòng lặp consumer còn kiểm được tín hiệu dừng.
+    // ioredis takes its timeout in SECONDS; 0 means wait forever, so it
+    // must be floored at 1 so the consumer loop can still check for a stop
+    // signal.
     const seconds = Math.max(1, Math.round(timeoutMs / 1000));
     const raw = await this.#blocking.brpoplpush(QUEUE, PROCESSING, seconds);
     return raw ? (JSON.parse(raw) as JobPayload) : null;
   }
 
   async ack(jobId: string): Promise<void> {
-    // Bỏ đúng phần tử của job này khỏi `processing`. Quét cả danh sách
-    // vì nó rất ngắn (đúng bằng số việc đang chạy, mặc định 1).
+    // Remove exactly this job's element from `processing`. Scanning the
+    // whole list is fine because it's very short (equal to the number of
+    // jobs currently running, 1 by default).
     const items = await this.#r.lrange(PROCESSING, 0, -1);
     for (const it of items) {
       try {
@@ -212,17 +218,18 @@ export class RedisJobQueue implements JobQueue {
           return;
         }
       } catch {
-        // Phần tử hỏng thì bỏ đi, đừng để nó kẹt lại mãi.
+        // A corrupt element is dropped rather than left stuck forever.
         await this.#r.lrem(PROCESSING, 1, it);
       }
     }
   }
 
   /**
-   * Việc còn nằm trong `processing` lúc worker khởi động là tàn dư của
-   * lần chết trước — tiến trình Codex đã đi theo pod và không bao giờ
-   * chạy tiếp. Trả về để bên gọi đánh dấu `failed`, thay vì để job treo
-   * ở "running" khiến Claude poll vô hạn.
+   * Work still sitting in `processing` when the worker starts up is a
+   * leftover from a previous death — the Codex process went down with the
+   * pod and will never resume. It's returned so the caller can mark it
+   * `failed`, instead of leaving the job stuck at "running" while Claude
+   * polls forever.
    */
   async reapStale(): Promise<JobPayload[]> {
     const items = await this.#r.lrange(PROCESSING, 0, -1);
@@ -232,14 +239,14 @@ export class RedisJobQueue implements JobQueue {
       try {
         out.push(JSON.parse(it) as JobPayload);
       } catch {
-        /* bỏ phần tử hỏng */
+        /* drop the corrupt element */
       }
     }
     return out;
   }
 
   async requestCancel(jobId: string): Promise<void> {
-    // TTL 1 giờ: cờ chỉ cần sống lâu hơn một job, giữ mãi là rác.
+    // 1-hour TTL: the flag only needs to outlive one job, keeping it forever is just garbage.
     await this.#r.set(`cancel:${jobId}`, "1", "EX", 3600);
   }
 

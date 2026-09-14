@@ -1,8 +1,8 @@
 {
-  "name": "tinyorbit-mcp",
-  "version": "0.2.0",
+  "name": "codex-imagegen-mcp",
+  "version": "0.4.0",
   "private": true,
-  "description": "Nền tảng MCP sinh ảnh của TinyOrbit — workspace gốc",
+  "description": "MCP server that generates images with the Codex CLI, billing a ChatGPT subscription instead of the OpenAI image API",
   "type": "module",
   "engines": {
     "node": ">=22.6.0"

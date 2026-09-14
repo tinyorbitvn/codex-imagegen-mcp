@@ -1,8 +1,7 @@
-// Vòng lặp tiêu thụ hàng đợi và chạy Codex.
+// Queue-consuming loop that runs Codex.
 //
-// Đây là thành phần DUY NHẤT chạm tới credential ChatGPT (spec §14,
-// §16). agentgateway, imagegen-mcp và Redis đều không mount được PVC
-// codex-home.
+// This is the ONLY component that touches the ChatGPT credential. Neither
+// agentgateway, imagegen-mcp, nor Redis can mount the codex-home PVC.
 
 import { mkdir, writeFile, rm, access, readdir, stat, copyFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -22,7 +21,7 @@ import type { CodexResult } from "./runner.ts";
 import { metrics } from "./metrics.ts";
 import { readImageInfo } from "./imagesize.ts";
 
-/** Cho phép test thay Codex thật bằng hàm giả. */
+/** Lets tests swap the real Codex for a fake function. */
 export type CodexRunner = (opts: {
   binary: string;
   codexHome: string;
@@ -38,7 +37,7 @@ export interface ConsumerConfig {
   codexBinary: string;
   jobTimeoutSeconds: number;
   concurrency: number;
-  /** Mặc định 24 nếu không truyền. 0 = không bao giờ dọn. */
+  /** Defaults to 24 if not passed. 0 = never clean up. */
   generatedImageRetentionHours?: number;
 }
 
@@ -50,7 +49,7 @@ export interface ConsumerDeps {
   runner?: CodexRunner;
 }
 
-/** Khoá S3 của artifact (spec §19). Ghép từ mảnh đã làm sạch. */
+/** S3 key layout for the artifact. Built from already-sanitized pieces. */
 export function artifactKey(
   projectId: string,
   assetId: string,
@@ -61,28 +60,34 @@ export function artifactKey(
 }
 
 /**
- * Cứu tấm ảnh Codex ĐÃ SINH nhưng không đặt đúng chỗ.
+ * Salvages an image Codex ALREADY GENERATED but never put in the right place.
  *
- * Công cụ sinh ảnh của Codex lưu vào $CODEX_HOME/generated_images/<phiên>/
- * rồi Codex mới chép sang đường dẫn ta yêu cầu. Bước chép đó có thể
- * không xảy ra mà tiến trình VẪN THOÁT MÃ 0 — hỏng câm. Đo trong pod
- * thật 2026-09-12: 9 file PNG mồ côi (5.3M), dấu thời gian khớp đúng
- * các job "failed". Ảnh đã sinh xong và ĐÃ TIÊU một lượt quota ChatGPT;
- * vứt đi là vứt tiền thật.
+ * Codex's image-generation tool saves into
+ * $CODEX_HOME/generated_images/<session>/ and Codex is then supposed to
+ * copy it to the path we requested. That copy step can fail to happen
+ * while the process STILL EXITS CODE 0 — a silent failure. Measured in a
+ * real pod on 2026-09-12: 9 orphaned PNG files (5.3M), timestamps lining
+ * up exactly with the "failed" jobs. The image had already been
+ * generated and had ALREADY SPENT a unit of ChatGPT quota; throwing it
+ * away is throwing away real money.
  *
- * Nguyên nhân đã tìm ra và đã sửa ở prompt.ts (chính câu cấm đọc ngoài
- * thư mục của ta khiến Codex từ chối chép ảnh nó vừa sinh). Hàm này vẫn
- * giữ làm LƯỚI AN TOÀN: exit code của Codex không phản ánh được việc có
- * file hay không, nên chừng nào còn phụ thuộc vào việc nó tự chép file
- * thì còn cần chỗ đỡ. Log ở mức warn để thấy được tần suất — nếu về 0
- * lâu dài thì bản vá prompt đang làm đủ việc.
+ * The root cause has been found and fixed in prompt.ts (specifically, the
+ * clause forbidding reads outside our own directory, which made Codex
+ * refuse to copy back the image it had just generated). This function
+ * stays in place as a SAFETY NET: Codex's exit code never reflects
+ * whether the file actually exists, so as long as we depend on it
+ * copying the file itself, we still need a backstop here. Logged at warn
+ * level so we can see the frequency — if it drops to zero for a long
+ * stretch, the prompt fix is doing its job well enough on its own.
  *
- * CẢNH BÁO khi sửa: KHÔNG thử "chữa" bằng cách cài python vào image.
- * Đã thử 2026-09-12 (tưởng Codex trượt ở bước tự kiểm bằng PIL) —
- * dựng lại image có python3 + PIL, chạy job thật, HỎNG Y HỆT.
+ * WARNING if you touch this: do NOT try to "fix" it by installing python
+ * in the image. Tried this 2026-09-12 (on the theory that Codex was
+ * failing a self-check using PIL) — rebuilt the image with python3 +
+ * PIL, ran a real job, STILL BROKE THE SAME WAY.
  *
- * Mốc `>= startedAtMs` là chốt chặn bắt buộc: ảnh của job trước không
- * được lọt vào, vì giao nhầm ảnh còn tệ hơn báo hỏng.
+ * The `>= startedAtMs` cutoff is a mandatory guard: an image from a
+ * previous job must never slip through, since handing back the wrong
+ * image is worse than reporting a failure.
  */
 export async function salvageGeneratedImage(
   codexHome: string,
@@ -103,7 +108,7 @@ export async function salvageGeneratedImage(
     try {
       files = await readdir(join(root, session));
     } catch {
-      continue; // không phải thư mục, hoặc vừa bị dọn
+      continue; // not a directory, or was just cleaned up
     }
     for (const f of files) {
       if (!/\.(png|jpe?g|webp)$/i.test(f)) continue;
@@ -114,7 +119,7 @@ export async function salvageGeneratedImage(
           best = { path: full, mtimeMs: st.mtimeMs };
         }
       } catch {
-        // file biến mất giữa chừng
+        // file disappeared mid-scan
       }
     }
   }
@@ -126,20 +131,21 @@ export async function salvageGeneratedImage(
 
 
 /**
- * Dọn ảnh cũ trong kho riêng của công cụ sinh ảnh.
+ * Cleans up old images in the image-generation tool's own private store.
  *
- * Codex để lại một bản trong $CODEX_HOME/generated_images/<phiên>/ SAU MỌI
- * job — kể cả job thành công, lúc ảnh đã nằm an toàn trên S3. Không dọn
- * thì PVC codex-home phình vô hạn: đo 2026-09-12 là 9 file / 5.9MB chỉ
- * sau một buổi thử, khoảng 0.7MB mỗi lượt.
+ * Codex leaves a copy behind in $CODEX_HOME/generated_images/<session>/
+ * AFTER EVERY job — including successful ones, once the image is already
+ * safely on S3. Without cleanup, the codex-home PVC grows without bound:
+ * measured 2026-09-12 at 9 files / 5.9MB after one afternoon of testing,
+ * roughly 0.7MB per run.
  *
- * Dọn theo TUỔI chứ không theo job: hàm chạy sau khi job xong, mà
- * salvageGeneratedImage() lại cần đọc kho này lúc job đang chạy. Cắt theo
- * tuổi thì hai việc không bao giờ giẫm chân nhau, kể cả sau này nâng
- * concurrency lên >1.
+ * Cleans up by AGE, not by job: this function runs after a job finishes,
+ * while salvageGeneratedImage() needs to read this same store while a job
+ * is still in flight. Cutting by age means the two never step on each
+ * other, even once concurrency is later raised above 1.
  *
- * Mọi lỗi đều nuốt: đây là việc dọn nhà, không đáng làm hỏng một job đã
- * chạy xong.
+ * All errors are swallowed: this is housekeeping, not worth failing an
+ * otherwise-completed job over.
  */
 export async function pruneGeneratedImages(
   codexHome: string,
@@ -164,7 +170,7 @@ export async function pruneGeneratedImages(
     } catch {
       continue;
     }
-    let conLai = files.length;
+    let remaining = files.length;
     for (const f of files) {
       const full = join(dir, f);
       try {
@@ -172,13 +178,14 @@ export async function pruneGeneratedImages(
         if (now - st.mtimeMs <= maxAgeMs) continue;
         await rm(full, { force: true });
         removed += 1;
-        conLai -= 1;
+        remaining -= 1;
       } catch {
-        /* bỏ qua */
+        /* ignore */
       }
     }
-    // Thư mục phiên rỗng thì bỏ luôn, đừng để lại hàng trăm thư mục rỗng.
-    if (conLai === 0) await rm(dir, { recursive: true, force: true }).catch(() => {});
+    // Drop an empty session directory right away, so we don't end up
+    // leaving hundreds of empty directories behind.
+    if (remaining === 0) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
   return removed;
 }
@@ -209,13 +216,13 @@ export class Consumer {
   }
 
   /**
-   * Vòng lặp chính. Chạy tới khi stop() được gọi.
+   * Main loop. Runs until stop() is called.
    *
-   * Concurrency mặc định 1 (spec §14): một phiên ChatGPT, một tiến trình
-   * Codex. Cho phép cấu hình để nâng sau, nhưng KHÔNG nâng mặc định.
+   * Concurrency defaults to 1: one ChatGPT session can only drive one
+   * Codex process at a time. Configurable to raise later, but do NOT raise the default.
    */
   async run(): Promise<void> {
-    log.info("consumer bắt đầu", {
+    log.info("consumer started", {
       concurrency: this.#cfg.concurrency,
       work_dir: this.#cfg.workDir,
     });
@@ -228,11 +235,12 @@ export class Consumer {
 
       let payload: JobPayload | null = null;
       try {
-        // Chờ tối đa 5 giây rồi quay lại kiểm cờ dừng — nhờ vậy pod tắt
-        // trong vài giây thay vì treo tới khi kubelet SIGKILL.
+        // Wait up to 5 seconds, then recheck the stop flag — so the pod
+        // shuts down within a few seconds instead of hanging until
+        // kubelet SIGKILLs it.
         payload = await this.#queue.dequeue(5000);
       } catch (err) {
-        log.error("đọc hàng đợi thất bại", { err });
+        log.error("failed to read from queue", { err });
         await sleep(1000);
         continue;
       }
@@ -244,9 +252,9 @@ export class Consumer {
       });
     }
 
-    // Chờ việc đang chạy kết thúc trước khi trả quyền cho caller.
+    // Wait for in-flight work to finish before returning control to the caller.
     while (this.#active > 0) await sleep(100);
-    log.info("consumer đã dừng");
+    log.info("consumer stopped");
   }
 
   async #handle(payload: JobPayload): Promise<void> {
@@ -261,8 +269,8 @@ export class Consumer {
     let ok = false;
 
     try {
-      // Job bị huỷ khi còn nằm trong hàng đợi thì đừng tốn một lượt
-      // Codex — đó là quota thật.
+      // If the job was cancelled while still sitting in the queue, don't
+      // spend a Codex run on it — that's real quota.
       if (await this.#queue.isCancelled(jobId)) {
         await this.#store.markCancelled(jobId);
         return;
@@ -270,9 +278,9 @@ export class Consumer {
 
       await this.#store.markRunning(jobId);
 
-      // Thư mục RIÊNG cho mỗi job (spec §24). Tên chứa UUID và worker
-      // không bao giờ ghép đường dẫn từ chuỗi người dùng, nên không job
-      // nào đọc được thư mục của job khác.
+      // A SEPARATE directory per job. The name contains a UUID and the
+      // worker never builds a path from a user-supplied string, so no job
+      // can ever read another job's directory.
       await mkdir(jobDir, { recursive: true, mode: 0o700 });
 
       let prompt: string;
@@ -285,9 +293,9 @@ export class Consumer {
         prompt = buildCreatePrompt(spec, jobDir);
       }
 
-      // Theo dõi cờ huỷ trong lúc Codex chạy: không có vòng này thì
-      // cancel_image_job chỉ đổi được trạng thái trên giấy còn tiến
-      // trình Codex vẫn chạy tới hết và vẫn tốn quota.
+      // Watch the cancel flag while Codex is running: without this loop,
+      // cancel_image_job would only flip a status on paper while the
+      // Codex process kept running to completion and still burned quota.
       const watcher = setInterval(() => {
         void this.#queue.isCancelled(jobId).then((c) => {
           if (c) controller.abort();
@@ -313,8 +321,9 @@ export class Consumer {
 
       if (result.exitCode !== 0) {
         const code = classifyCodexFailure(result.stderrTail);
-        // stderr CHỈ vào log phía server (đã lọc secret), KHÔNG ra MCP.
-        log.warn("codex thoát với mã khác 0", {
+        // stderr ONLY goes to server-side logs (secrets already filtered
+        // out), NEVER back over MCP.
+        log.warn("codex exited with non-zero status", {
           job_id: jobId,
           codex_exit_code: result.exitCode,
           classified: code,
@@ -323,15 +332,16 @@ export class Consumer {
         throw new ImagegenError(code, messageFor(code));
       }
 
-      // Codex thoát 0 KHÔNG bảo đảm file đã nằm đúng chỗ — xem
-      // salvageGeneratedImage. Kiểm rồi cứu trước khi kết luận hỏng.
+      // Codex exiting 0 does NOT guarantee the file landed where expected
+      // — see salvageGeneratedImage. Check, then salvage, before
+      // concluding it failed.
       const outPath = join(jobDir, spec.filename);
       try {
         await access(outPath);
       } catch {
         const saved = await salvageGeneratedImage(this.#cfg.codexHome, outPath, started);
         if (!saved) {
-          log.warn("codex thoát 0 nhưng không có ảnh, cũng không cứu được", {
+          log.warn("codex exited 0 but produced no image, and none could be salvaged", {
             job_id: jobId,
           });
           throw new ImagegenError(
@@ -339,41 +349,45 @@ export class Consumer {
             messageFor("IMAGE_GENERATION_FAILED"),
           );
         }
-        // Mức warn chứ không im lặng: đây là bản vá cho hành vi thất
-        // thường của Codex, phải thấy được tần suất mới biết lúc nào
-        // upstream sửa xong thì gỡ.
-        log.warn("codex không đặt ảnh đúng chỗ — đã cứu từ generated_images", {
+        // Warn level rather than silent: this is a workaround for
+        // erratic Codex behavior, and we need visibility into how often
+        // it happens to know when upstream has actually fixed it.
+        log.warn("codex did not place the image correctly — salvaged it from generated_images", {
           job_id: jobId,
         });
       }
 
-      // *** ĐO ẢNH THẬT, ĐỪNG CHÉP LẠI YÊU CẦU ***
-      // Bản cũ ghi `width: spec.width` — tức khai lại con số ta ĐÃ XIN,
-      // không phải con số ta NHẬN ĐƯỢC. Đo trên job thật 2026-09-12:
-      // xin 1536x1536, Codex trả 1254x1254, metadata vẫn khai 1536x1536.
-      // Claude đọc metadata đó rồi dựng bố cục sai mà không ai biết.
+      // *** MEASURE THE REAL IMAGE, DON'T ECHO THE REQUEST ***
+      // The old version wrote `width: spec.width` — i.e. it re-declared
+      // the number we ASKED FOR, not the number we ACTUALLY GOT. Measured
+      // on a real job 2026-09-12: asked for 1536x1536, Codex returned
+      // 1254x1254, and the metadata still claimed 1536x1536. Claude reads
+      // that metadata and builds a layout on the wrong assumption, with
+      // no one the wiser.
       //
-      // Không đọc được header thì LÙI về đặc tả và ghi log, chứ không
-      // làm hỏng cả job: ảnh vẫn dùng được, chỉ là số đo kém tin cậy.
+      // If the header can't be read, FALL BACK to the spec and log it,
+      // rather than failing the whole job: the image is still usable,
+      // just with a less trustworthy measurement.
       const info = await readImageInfo(outPath);
       if (!info) {
-        log.warn("không đọc được kích thước ảnh, dùng tạm số trong đặc tả", {
+        log.warn("could not read image dimensions, falling back to the spec's numbers", {
           job_id: jobId,
           output_format: spec.outputFormat,
         });
       } else if (info.width !== spec.width || info.height !== spec.height) {
-        // Không phải lỗi: mô hình sinh ảnh có tỉ lệ riêng của nó. Ghi log
-        // để thấy được độ lệch thường gặp là bao nhiêu.
-        log.info("kích thước ảnh khác đặc tả", {
+        // Not an error: the generation model has its own sense of aspect
+        // ratio. Logged so we can see how large the typical drift is.
+        log.info("image dimensions differ from the spec", {
           job_id: jobId,
-          xin: `${spec.width}x${spec.height}`,
-          nhan: `${info.width}x${info.height}`,
+          requested: `${spec.width}x${spec.height}`,
+          received: `${info.width}x${info.height}`,
         });
       }
       if (info && spec.transparentBackground && !info.hasAlpha) {
-        // Đây MỚI là lỗi đáng kêu: xin nền trong suốt mà ảnh không có
-        // kênh alpha thì chắc chắn không trong suốt được.
-        log.warn("xin nền trong suốt nhưng ảnh không có kênh alpha", {
+        // THIS is actually worth flagging: we asked for a transparent
+        // background but the image has no alpha channel, so it's
+        // definitely not transparent.
+        log.warn("requested a transparent background but the image has no alpha channel", {
           job_id: jobId,
         });
       }
@@ -394,16 +408,16 @@ export class Consumer {
         mimeType,
         width: info?.width ?? spec.width,
         height: info?.height ?? spec.height,
-        // `transparent` mô tả FILE, nên lấy theo file. Ranh giới của cờ
-        // này ghi ở ImageInfo.hasAlpha: "có kênh alpha", không phải "có
-        // pixel trong suốt".
+        // `transparent` describes the FILE, so it's taken from the file.
+        // The boundary of this flag is documented on ImageInfo.hasAlpha:
+        // "has an alpha channel", not "has transparent pixels".
         transparent: info?.hasAlpha ?? spec.transparentBackground,
         specHash: specHash(prompt),
         createdAt: new Date().toISOString(),
       };
 
-      // metadata.json nằm cạnh ảnh (spec §19). KHÔNG chứa credential,
-      // KHÔNG chứa đặc tả nguyên văn — chỉ bản băm.
+      // metadata.json sits next to the image. Contains NO credentials,
+      // and NOT the raw spec — only its hash.
       await this.#storage.uploadMetadata(
         artifactKey(spec.projectId, spec.assetId, payload.version, "metadata.json"),
         {
@@ -433,25 +447,28 @@ export class Consumer {
         await this.#store.markFailed(jobId, e.code, e.message);
       }
     } finally {
-      // Dọn thư mục job dù thành công hay thất bại: ảnh đã lên object
-      // storage, giữ lại chỉ làm đầy emptyDir cho tới khi node hết đĩa.
+      // Clean up the job directory whether it succeeded or failed: the
+      // image has already made it to object storage, so keeping it
+      // around only fills up the emptyDir until the node runs out of
+      // disk.
       await rm(jobDir, { recursive: true, force: true }).catch(() => {});
 
-      // Dọn kho ảnh của Codex (xem pruneGeneratedImages). Không để hỏng
-      // đường kết thúc job: hàm đã tự nuốt lỗi, ở đây bắt thêm một lớp.
+      // Clean up Codex's own image store (see pruneGeneratedImages).
+      // Don't let this break the job's exit path: the function already
+      // swallows its own errors, this is one more layer of protection.
       try {
-        const gio = this.#cfg.generatedImageRetentionHours ?? 24;
-        const n = await pruneGeneratedImages(this.#cfg.codexHome, gio * 3_600_000);
-        if (n > 0) log.info("đã dọn ảnh cũ trong kho của Codex", { so_file: n });
+        const retentionHours = this.#cfg.generatedImageRetentionHours ?? 24;
+        const n = await pruneGeneratedImages(this.#cfg.codexHome, retentionHours * 3_600_000);
+        if (n > 0) log.info("cleaned up old images in Codex's store", { files_removed: n });
       } catch {
-        /* dọn nhà hỏng thì thôi */
+        /* a failed cleanup is not worth failing over */
       }
       await this.#queue.ack(jobId);
 
       const durationMs = Date.now() - started;
       metrics.jobFinished(durationMs / 1000, ok);
       const final = await this.#store.get(jobId).catch(() => null);
-      log.info("job kết thúc", {
+      log.info("job finished", {
         job_id: jobId,
         project_id: spec.projectId,
         asset_id: spec.assetId,
@@ -469,19 +486,21 @@ function messageFor(code: string): string {
   switch (code) {
     case "CODEX_NOT_AUTHENTICATED":
       return (
-        "Phiên đăng nhập ChatGPT của worker đã hết hạn. " +
-        "Người vận hành cần chạy lại `codex login --device-auth` trong pod."
+        "The worker's ChatGPT login session has expired. " +
+        "An operator needs to run `codex login --device-auth` in the pod again."
       );
     case "IMAGE_CAPABILITY_UNAVAILABLE":
-      // Spec §31: nói thẳng là thiếu khả năng, và nói rõ KHÔNG có đường
-      // vòng qua API key — để không ai đi "sửa" bằng cách đó.
+      // State plainly that the capability is missing, and make it
+      // explicit that there is NO fallback through an API key — so no one
+      // tries to "fix" it that way.
       return (
-        "Tài khoản ChatGPT đang đăng nhập không dùng được khả năng sinh ảnh " +
-        "của Codex. Nền tảng KHÔNG tự chuyển sang OpenAI API key; cần một " +
-        "tài khoản/gói có hỗ trợ sinh ảnh."
+        "The currently logged-in ChatGPT account cannot use Codex's " +
+        "image-generation capability. The platform does NOT automatically fall " +
+        "back to an OpenAI API key; an account/plan with image-generation " +
+        "support is required."
       );
     default:
-      return "Codex không sinh được ảnh. Xem log của codex-image-worker theo job_id.";
+      return "Codex failed to generate the image. Check codex-image-worker's logs for this job_id.";
   }
 }
 

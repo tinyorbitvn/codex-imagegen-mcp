@@ -1,13 +1,15 @@
-// Đọc kích thước THẬT của ảnh từ header.
+// Reads the REAL dimensions of an image from its header.
 //
-// *** VÌ SAO CẦN FILE NÀY ***
-// Trước đây consumer ghi `width: spec.width` — tức chép lại YÊU CẦU chứ
-// không đo sản phẩm. Đo trên job thật 2026-09-12: xin 1536x1536, ảnh
-// Codex trả về là 1254x1254, mà metadata vẫn khai 1536x1536. Claude đọc
-// metadata đó sẽ tin nhầm và bố cục sai.
+// *** WHY THIS FILE EXISTS ***
+// The consumer used to write `width: spec.width` — i.e. it echoed back
+// the REQUEST instead of measuring the actual output. Measured on a real
+// job 2026-09-12: we asked for 1536x1536, Codex returned 1254x1254, yet
+// the metadata still claimed 1536x1536. Claude reads that metadata and
+// builds a layout on the wrong assumption.
 //
-// Chỉ đọc HEADER, không giải mã ảnh: rẻ, không phụ thuộc thư viện ngoài,
-// và đủ để lấy kích thước cho cả hai định dạng ta hỗ trợ (png, webp).
+// Only reads the HEADER, doesn't decode the image: cheap, no external
+// library dependency, and enough to get dimensions for both formats we
+// support (png, webp).
 
 import { open } from "node:fs/promises";
 
@@ -15,69 +17,72 @@ export interface ImageInfo {
   width: number;
   height: number;
   /**
-   * File CÓ kênh alpha hay không.
+   * Whether the file HAS an alpha channel.
    *
-   * Lưu ý ranh giới: đây là "có kênh alpha", KHÔNG phải "có pixel trong
-   * suốt". Muốn khẳng định vế sau thì phải giải nén toàn bộ ảnh rồi quét
-   * từng pixel — đắt hơn nhiều mà giá trị thêm không đáng. Ảnh không có
-   * kênh alpha thì chắc chắn KHÔNG trong suốt, nên cờ này đủ để bắt đúng
-   * trường hợp hỏng: xin nền trong suốt mà nhận về ảnh đặc.
+   * Mind the boundary: this means "has an alpha channel", NOT "has
+   * transparent pixels". Confirming the latter would require decoding
+   * the whole image and scanning every pixel — much more expensive for
+   * little added value. An image with no alpha channel is guaranteed
+   * NOT transparent, so this flag is enough to catch the case that
+   * actually matters: asking for a transparent background and getting an
+   * opaque image back.
    */
   hasAlpha: boolean;
 }
 
-/** 32 bit big-endian. */
+/** 32-bit big-endian. */
 function be32(b: Buffer, off: number): number {
   return b.readUInt32BE(off);
 }
 
 function readPng(b: Buffer): ImageInfo | null {
-  // 8 byte chữ ký, rồi chunk ĐẦU TIÊN bắt buộc là IHDR (chuẩn PNG §11.2.2):
-  //   [8..11] độ dài, [12..15] "IHDR", [16..19] rộng, [20..23] cao,
-  //   [24] độ sâu bit, [25] color type.
+  // 8-byte signature, then the FIRST chunk must be IHDR (PNG spec §11.2.2):
+  //   [8..11] length, [12..15] "IHDR", [16..19] width, [20..23] height,
+  //   [24] bit depth, [25] color type.
   if (b.length < 26) return null;
   if (b.toString("latin1", 12, 16) !== "IHDR") return null;
   const colorType = b[25]!;
-  // color type 4 = xám + alpha, 6 = RGB + alpha. 3 là bảng màu — có thể
-  // trong suốt qua chunk tRNS, nên phải dò thêm.
+  // color type 4 = grayscale + alpha, 6 = RGB + alpha. 3 is palette —
+  // it can still be transparent via a tRNS chunk, so probe further.
   let hasAlpha = colorType === 4 || colorType === 6;
   if (!hasAlpha && colorType === 3) hasAlpha = hasTrns(b);
   return { width: be32(b, 16), height: be32(b, 20), hasAlpha };
 }
 
-/** Dò chunk tRNS (bảng màu có ô trong suốt). Đi theo chuỗi chunk, không quét mù. */
+/** Look for a tRNS chunk (palette with a transparent entry). Walk the chunk chain, don't scan blindly. */
 function hasTrns(b: Buffer): boolean {
   let off = 8;
   while (off + 8 <= b.length) {
     const len = be32(b, off);
     const type = b.toString("latin1", off + 4, off + 8);
     if (type === "tRNS") return true;
-    if (type === "IDAT" || type === "IEND") return false; // tRNS phải đứng trước IDAT
-    off += 12 + len; // 4 độ dài + 4 kiểu + dữ liệu + 4 CRC
-    if (len < 0 || off <= 0) return false; // độ dài rác -> dừng, đừng lặp vô tận
+    if (type === "IDAT" || type === "IEND") return false; // tRNS must come before IDAT
+    off += 12 + len; // 4 length + 4 type + data + 4 CRC
+    if (len < 0 || off <= 0) return false; // garbage length -> bail, don't loop forever
   }
   return false;
 }
 
 function readWebp(b: Buffer): ImageInfo | null {
-  // RIFF container: [0..3]="RIFF", [8..11]="WEBP", [12..15] fourcc của
-  // chunk đầu. Ba biến thể, mỗi biến thể một cách khai kích thước.
+  // RIFF container: [0..3]="RIFF", [8..11]="WEBP", [12..15] the fourcc of
+  // the first chunk. Three variants, each with its own way of encoding
+  // dimensions.
   if (b.length < 30) return null;
   const fourcc = b.toString("latin1", 12, 16);
 
   if (fourcc === "VP8X") {
-    // Chunk mở rộng: [20] cờ, [24..26] rộng-1, [27..29] cao-1 (24 bit LE).
+    // Extended chunk: [20] flags, [24..26] width-1, [27..29] height-1 (24-bit LE).
     const flags = b[20]!;
     return {
       width: b.readUIntLE(24, 3) + 1,
       height: b.readUIntLE(27, 3) + 1,
-      hasAlpha: (flags & 0x10) !== 0, // bit ALPHA
+      hasAlpha: (flags & 0x10) !== 0, // ALPHA bit
     };
   }
 
   if (fourcc === "VP8L") {
-    // Lossless: [20]=0x2f, rồi 32 bit LE chứa (rộng-1) 14 bit, (cao-1)
-    // 14 bit, 1 bit alpha, 3 bit version.
+    // Lossless: [20]=0x2f, then a 32-bit LE value packing (width-1) 14
+    // bits, (height-1) 14 bits, 1 alpha bit, 3 version bits.
     if (b[20] !== 0x2f) return null;
     const bits = b.readUInt32LE(21);
     return {
@@ -88,20 +93,21 @@ function readWebp(b: Buffer): ImageInfo | null {
   }
 
   if (fourcc === "VP8 ") {
-    // Lossy: khung key bắt đầu ở [23..25] = 9d 01 2a, rồi rộng/cao 16 bit
-    // LE (14 bit thấp là kích thước, 2 bit cao là tỉ lệ thu phóng).
+    // Lossy: the key frame starts at [23..25] = 9d 01 2a, then
+    // width/height as 16-bit LE (low 14 bits are the size, top 2 bits are
+    // the scaling factor).
     if (b[23] !== 0x9d || b[24] !== 0x01 || b[25] !== 0x2a) return null;
     return {
       width: b.readUInt16LE(26) & 0x3fff,
       height: b.readUInt16LE(28) & 0x3fff,
-      hasAlpha: false, // VP8 trần không có alpha (phải bọc trong VP8X)
+      hasAlpha: false, // bare VP8 has no alpha (must be wrapped in VP8X)
     };
   }
 
   return null;
 }
 
-/** Nhận diện theo NỘI DUNG, không theo đuôi file. */
+/** Identify by CONTENT, not by file extension. */
 export function parseImageHeader(b: Buffer): ImageInfo | null {
   if (b.length >= 8 && b.toString("latin1", 0, 8) === "\x89PNG\r\n\x1a\n") return readPng(b);
   if (b.length >= 12 && b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP") {
@@ -111,12 +117,13 @@ export function parseImageHeader(b: Buffer): ImageInfo | null {
 }
 
 /**
- * Đọc kích thước ảnh từ đĩa. Trả null nếu không nhận dạng được — người
- * gọi tự quyết định lùi về đâu, hàm này KHÔNG đoán bừa.
+ * Reads image dimensions from disk. Returns null when unrecognized —
+ * the caller decides what to fall back to, this function does NOT guess.
  */
 export async function readImageInfo(path: string): Promise<ImageInfo | null> {
-  // 64KB đầu là thừa đủ: PNG khai kích thước ở byte 16, WebP ở byte 24;
-  // phần dư chỉ để dò chunk tRNS của ảnh bảng màu.
+  // The first 64KB is more than enough: PNG declares its size at byte 16,
+  // WebP at byte 24; the rest is only there to find the tRNS chunk of a
+  // palette image.
   const fh = await open(path, "r");
   try {
     const buf = Buffer.alloc(65536);

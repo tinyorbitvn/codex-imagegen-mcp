@@ -1,17 +1,18 @@
-// Mã lỗi theo spec §36.
+// Error codes returned to MCP clients.
 //
-// Thông điệp trả ra ngoài phải AN TOÀN VÀ HÀNH ĐỘNG ĐƯỢC: nói người gọi
-// cần làm gì, KHÔNG kèm credential, KHÔNG dump biến môi trường, KHÔNG
-// kèm stderr thô của tiến trình con (stderr của Codex có thể chứa đường
-// dẫn token hoặc mẩu header xác thực).
+// Messages returned to the outside world must be SAFE AND ACTIONABLE: tell
+// the caller what to do, with NO credentials, NO environment variable
+// dumps, and NO raw stderr from a child process (Codex's stderr can
+// contain token paths or fragments of auth headers).
 
 export const ERROR_CODES = [
   "CODEX_NOT_AUTHENTICATED",
   "CODEX_NOT_AVAILABLE",
-  // Tài khoản/phiên ChatGPT đăng nhập được nhưng KHÔNG có khả năng sinh
-  // ảnh. Spec §31 đòi báo lỗi khả năng tường minh thay vì im lặng rơi
-  // về OPENAI_API_KEY — mã riêng để vận hành phân biệt được "chưa đăng
-  // nhập" với "đăng nhập rồi nhưng gói không hỗ trợ".
+  // The ChatGPT account/session can log in but has NO image generation
+  // capability. This needs an explicit capability error instead of
+  // silently falling back to OPENAI_API_KEY — a dedicated code so
+  // operations can tell "not logged in" apart from "logged in but the
+  // plan doesn't support it".
   "IMAGE_CAPABILITY_UNAVAILABLE",
   "IMAGE_GENERATION_FAILED",
   "JOB_NOT_FOUND",
@@ -37,24 +38,25 @@ export class ImagegenError extends Error {
     this.code = code;
   }
 
-  /** Dạng đưa vào structuredContent của MCP. */
+  /** Shape to put into an MCP structuredContent. */
   toJSON(): { error: { code: ErrorCode; message: string } } {
     return { error: { code: this.code, message: this.message } };
   }
 }
 
 /**
- * Biến lỗi bất kỳ thành ImagegenError.
+ * Turns an arbitrary error into an ImagegenError.
  *
- * Lỗi KHÔNG phải ImagegenError (bug, lỗi mạng, lỗi SDK) bị nuốt thông
- * điệp gốc CÓ CHỦ ĐÍCH: message của chúng hay kèm URL đầy đủ, header,
- * hoặc đường dẫn nội bộ. Chi tiết thật vẫn được ghi log phía server
- * (đã lọc) để vận hành lần ra, nhưng không đi ra ngoài qua MCP.
+ * Errors that are NOT an ImagegenError (bugs, network errors, SDK errors)
+ * DELIBERATELY have their original message swallowed: their message text
+ * often carries a full URL, headers, or an internal path. The real detail
+ * is still logged server-side (redacted) so operations can trace it, but
+ * it never leaves through MCP.
  */
 export function toImagegenError(err: unknown, fallback: ErrorCode): ImagegenError {
   if (err instanceof ImagegenError) return err;
   return new ImagegenError(
     fallback,
-    "Thao tác thất bại. Xem log của service theo job_id để biết chi tiết.",
+    "Operation failed. Check the service logs for this job_id for details.",
   );
 }

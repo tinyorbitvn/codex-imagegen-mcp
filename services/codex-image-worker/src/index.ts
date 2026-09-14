@@ -1,7 +1,7 @@
-// codex-image-worker — tiêu thụ hàng đợi, chạy Codex, đẩy artifact.
+// codex-image-worker — consumes the queue, runs Codex, pushes the artifact.
 //
-// KHÔNG phơi MCP, KHÔNG có HTTPRoute. Cổng HTTP duy nhất chỉ phục vụ
-// health probe và metrics, nghe trong cụm (spec §23).
+// Exposes NO MCP, has NO HTTPRoute. The only HTTP port serves health
+// probes and metrics, listening in-cluster only.
 
 import express from "express";
 import { access, constants, mkdir } from "node:fs/promises";
@@ -38,34 +38,35 @@ const consumer = new Consumer({
   },
 });
 
-// Việc còn nằm trong danh sách `processing` lúc khởi động là tàn dư của
-// lần chết trước: tiến trình Codex đã đi theo pod và không bao giờ chạy
-// tiếp. Đánh dấu failed ngay, thay vì để job treo ở "running" khiến
-// Claude poll vô hạn (spec §12).
+// Anything still sitting in the `processing` list at startup is a
+// leftover from a previous death: its Codex process went down with the
+// pod and will never continue. Mark it failed right away, instead of
+// leaving the job stuck in "running" while Claude polls forever.
 const stale = await queue.reapStale();
 for (const p of stale) {
   await store.markFailed(
     p.jobId,
     "IMAGE_GENERATION_FAILED",
-    "Worker khởi động lại khi job đang chạy",
+    "Worker restarted while the job was running",
   );
 }
 if (stale.length > 0) {
-  log.warn("đánh dấu thất bại cho job treo từ lần chạy trước", { count: stale.length });
+  log.warn("marked stale jobs from the previous run as failed", { count: stale.length });
 }
 
 const app = express();
 
-// live: chỉ hỏi tiến trình còn chạy không. KHÔNG kiểm phụ thuộc ngoài —
-// Redis chớp nháy không nên khiến kubelet giết worker đang sinh ảnh.
+// live: only asks whether the process is still running. Does NOT check
+// external dependencies — a Redis blip shouldn't get kubelet to kill a
+// worker that's busy generating an image.
 app.get("/health/live", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-// ready: đủ điều kiện nhận việc chưa.
+// ready: whether we're fit to take work.
 //
-// CỐ Ý KHÔNG sinh ảnh thử — probe chạy vài chục giây một lần, mỗi lần
-// sinh ảnh là một lần tốn quota ChatGPT thật.
+// DELIBERATELY does NOT generate a test image — the probe runs every few
+// tens of seconds, and every image generated is real ChatGPT quota spent.
 app.get("/health/ready", async (_req, res) => {
   const checks: Record<string, boolean> = {
     work_dir_writable: false,
@@ -80,7 +81,7 @@ app.get("/health/ready", async (_req, res) => {
     await access(config.workDir, constants.W_OK);
     checks.work_dir_writable = true;
   } catch {
-    /* để false */
+    /* leave false */
   }
 
   checks.codex_present = await isCodexAvailable(config.codexBinary);
@@ -90,12 +91,12 @@ app.get("/health/ready", async (_req, res) => {
     await store.client.ping();
     checks.redis = true;
   } catch {
-    /* để false */
+    /* leave false */
   }
 
   const ready = Object.values(checks).every(Boolean);
-  // Phiên ChatGPT hết hạn -> ready=false. Worker KHÔNG âm thầm chuyển
-  // sang OPENAI_API_KEY (spec §31) — không có nhánh mã nào làm việc đó.
+  // ChatGPT session expired -> ready=false. The worker does NOT silently
+  // fall back to OPENAI_API_KEY — no code path does that.
   res.status(ready ? 200 : 503).json({ status: ready ? "ready" : "not-ready", checks });
 });
 
@@ -104,7 +105,7 @@ app.get("/metrics", (_req, res) => {
 });
 
 const server = app.listen(config.port, () => {
-  log.info("codex-image-worker đang nghe", {
+  log.info("codex-image-worker listening", {
     port: config.port,
     concurrency: config.concurrency,
   });
@@ -112,10 +113,11 @@ const server = app.listen(config.port, () => {
 
 void consumer.run();
 
-// Tắt êm: ngừng nhận việc mới, chờ việc đang chạy xong, rồi đóng kết nối.
+// Graceful shutdown: stop accepting new work, wait for in-flight work to
+// finish, then close connections.
 for (const sig of ["SIGTERM", "SIGINT"] as const) {
   process.on(sig, () => {
-    log.info("nhận tín hiệu dừng, chờ job đang chạy kết thúc", { signal: sig });
+    log.info("received stop signal, waiting for in-flight job to finish", { signal: sig });
     consumer.stop();
     server.close(() => {
       void Promise.allSettled([store.close(), queue.close()]).then(() => process.exit(0));

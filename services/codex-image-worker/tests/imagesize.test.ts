@@ -1,7 +1,8 @@
-// Đọc kích thước ảnh từ header.
+// Reads image dimensions from the header.
 //
-// Ảnh PNG trong test được DỰNG THẬT bằng zlib (có IDAT hợp lệ), không
-// phải header giả, để bộ đọc bị ràng đúng thứ nó sẽ gặp lúc chạy.
+// The PNGs in this test are BUILT FOR REAL using zlib (with a valid
+// IDAT), not fake headers, so the parser is tested against exactly what
+// it will encounter at runtime.
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -12,22 +13,22 @@ import { join } from "node:path";
 
 import { parseImageHeader, readImageInfo } from "../src/imagesize.ts";
 
-/** Dựng một PNG hợp lệ tối thiểu. colorType: 2=RGB, 6=RGBA, 3=bảng màu. */
-function pngThat(width: number, height: number, colorType: number, themTrns = false): Buffer {
-  const kenh = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colorType]!;
+/** Builds a minimal valid PNG. colorType: 2=RGB, 6=RGBA, 3=palette. */
+function pngThat(width: number, height: number, colorType: number, withTrns = false): Buffer {
+  const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colorType]!;
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // độ sâu bit
+  ihdr[8] = 8; // bit depth
   ihdr[9] = colorType;
 
-  // Mỗi hàng: 1 byte filter + width*kênh byte dữ liệu.
-  const raw = Buffer.alloc(height * (1 + width * kenh));
+  // Each row: 1 filter byte + width*channels data bytes.
+  const raw = Buffer.alloc(height * (1 + width * channels));
   const idat = deflateSync(raw);
 
   const chunks: Buffer[] = [chunk("IHDR", ihdr)];
   if (colorType === 3) chunks.push(chunk("PLTE", Buffer.alloc(3)));
-  if (themTrns) chunks.push(chunk("tRNS", Buffer.from([0])));
+  if (withTrns) chunks.push(chunk("tRNS", Buffer.from([0])));
   chunks.push(chunk("IDAT", idat), chunk("IEND", Buffer.alloc(0)));
 
   return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), ...chunks]);
@@ -36,28 +37,29 @@ function pngThat(width: number, height: number, colorType: number, themTrns = fa
 function chunk(type: string, data: Buffer): Buffer {
   const len = Buffer.alloc(4);
   len.writeUInt32BE(data.length, 0);
-  // CRC không được bộ đọc kiểm, nhưng để 0 thì file vẫn đúng cấu trúc
-  // chuỗi chunk — đó mới là thứ hàm dò tRNS đi theo.
+  // The reader doesn't check the CRC, but leaving it at 0 still keeps the
+  // file's chunk-chain structure valid — which is what the tRNS-lookup
+  // function actually follows.
   return Buffer.concat([len, Buffer.from(type, "latin1"), data, Buffer.alloc(4)]);
 }
 
 describe("parseImageHeader — PNG", () => {
-  test("đọc đúng chiều rộng và chiều cao", () => {
+  test("reads width and height correctly", () => {
     const i = parseImageHeader(pngThat(1254, 800, 6));
     assert.deepEqual([i?.width, i?.height], [1254, 800]);
   });
 
-  test("RGBA (colorType 6) có kênh alpha", () => {
+  test("RGBA (colorType 6) has an alpha channel", () => {
     assert.equal(parseImageHeader(pngThat(4, 4, 6))?.hasAlpha, true);
   });
 
-  test("RGB (colorType 2) KHÔNG có kênh alpha", () => {
+  test("RGB (colorType 2) has NO alpha channel", () => {
     assert.equal(parseImageHeader(pngThat(4, 4, 2))?.hasAlpha, false);
   });
 
-  test("ảnh bảng màu có tRNS thì vẫn tính là có alpha", () => {
-    // Trường hợp dễ bỏ sót nhất: colorType 3 không nói gì về alpha,
-    // thông tin nằm ở chunk tRNS đứng trước IDAT.
+  test("a palette image with tRNS still counts as having alpha", () => {
+    // The easiest case to miss: colorType 3 says nothing about alpha on
+    // its own, the information lives in the tRNS chunk preceding IDAT.
     assert.equal(parseImageHeader(pngThat(4, 4, 3, true))?.hasAlpha, true);
     assert.equal(parseImageHeader(pngThat(4, 4, 3, false))?.hasAlpha, false);
   });
@@ -75,16 +77,16 @@ describe("parseImageHeader — WebP", () => {
     return Buffer.concat([head, ch, body]);
   }
 
-  test("VP8X đọc kích thước canvas và cờ alpha", () => {
+  test("VP8X reads canvas dimensions and the alpha flag", () => {
     const body = Buffer.alloc(10);
-    body[0] = 0x10; // cờ ALPHA
+    body[0] = 0x10; // ALPHA flag
     body.writeUIntLE(1536 - 1, 4, 3);
     body.writeUIntLE(1024 - 1, 7, 3);
     const i = parseImageHeader(riff("VP8X", body));
     assert.deepEqual([i?.width, i?.height, i?.hasAlpha], [1536, 1024, true]);
   });
 
-  test("VP8L đọc kích thước gói trong 14 bit", () => {
+  test("VP8L reads dimensions packed into 14 bits", () => {
     const body = Buffer.alloc(20);
     body[0] = 0x2f;
     const bits = (300 - 1) | ((200 - 1) << 14) | (1 << 28);
@@ -93,7 +95,7 @@ describe("parseImageHeader — WebP", () => {
     assert.deepEqual([i?.width, i?.height, i?.hasAlpha], [300, 200, true]);
   });
 
-  test("VP8 trần đọc được kích thước, và không có alpha", () => {
+  test("bare VP8 reads dimensions, and has no alpha", () => {
     const body = Buffer.alloc(20);
     body[3] = 0x9d;
     body[4] = 0x01;
@@ -105,23 +107,23 @@ describe("parseImageHeader — WebP", () => {
   });
 });
 
-describe("parseImageHeader — thứ không nhận dạng được", () => {
-  test("trả null chứ KHÔNG đoán bừa", () => {
-    // Quan trọng: đoán bừa ở đây nghĩa là ghi một con số sai vào
-    // metadata mà không ai biết. Thà trả null để người gọi lùi về đặc
-    // tả và ghi log.
-    assert.equal(parseImageHeader(Buffer.from("khong phai anh")), null);
+describe("parseImageHeader — unrecognized content", () => {
+  test("returns null instead of guessing wildly", () => {
+    // Important: guessing here would mean writing a wrong number into
+    // metadata without anyone knowing. Better to return null and let the
+    // caller fall back to the spec and log it.
+    assert.equal(parseImageHeader(Buffer.from("not an image")), null);
     assert.equal(parseImageHeader(Buffer.alloc(0)), null);
     assert.equal(parseImageHeader(Buffer.from("RIFFxxxxWEBPZZZZ")), null);
   });
 
-  test("PNG cụt ở giữa IHDR trả null, không ném lỗi", () => {
+  test("a PNG truncated mid-IHDR returns null, doesn't throw", () => {
     assert.equal(parseImageHeader(pngThat(4, 4, 6).subarray(0, 20)), null);
   });
 });
 
-describe("readImageInfo — đọc từ đĩa", () => {
-  test("mở file thật và đọc đúng số đo", async () => {
+describe("readImageInfo — reads from disk", () => {
+  test("opens a real file and reads the correct dimensions", async () => {
     const dir = await mkdtemp(join(tmpdir(), "imagesize-"));
     try {
       const f = join(dir, "a.png");

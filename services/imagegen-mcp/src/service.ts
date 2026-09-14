@@ -1,12 +1,13 @@
-// Nghiệp vụ của imagegen-mcp.
+// Business logic of imagegen-mcp.
 //
-// *** GẦN NHƯ KHÔNG TRẠNG THÁI (spec §10) ***
-// Service này KHÔNG chạy Codex, KHÔNG giữ credential ChatGPT, KHÔNG giữ
-// job trong bộ nhớ. Nó chỉ: kiểm đầu vào, chuẩn hoá đặc tả ảnh, ghi bản
-// ghi job, đẩy việc vào hàng đợi, rồi đọc trạng thái ra.
+// *** NEARLY STATELESS ***
+// This service does NOT run Codex, does NOT hold ChatGPT credentials,
+// does NOT keep jobs in memory. It only: validates input, normalizes the
+// image spec, writes a job record, pushes work onto the queue, and then
+// reads status back out.
 //
-// Nhờ vậy nó chạy được nhiều replica và restart thoải mái — mọi trạng
-// thái thật nằm ở Redis.
+// Thanks to that it can run many replicas and restart freely — all real
+// state lives in Redis.
 
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
@@ -46,27 +47,31 @@ export interface JobHandle {
 }
 
 /**
- * `job_id` dạng img_<uuid không gạch>.
+ * `job_id` in the form img_<uuid without dashes>.
  *
- * Phần ngẫu nhiên đủ rộng để không đoán được job của người khác —
- * get_image_job chỉ kiểm job_id nên đoán được là đọc được.
+ * The random part is wide enough that someone else's job can't be
+ * guessed — get_image_job only checks the job_id, so guessing it means
+ * reading it.
  */
 function newJobId(): string {
   return `img_${randomUUID().replace(/-/g, "")}`;
 }
 
-/** Vân tay đặc tả, ghi vào metadata artifact (spec §19). */
+/** Fingerprint of the resolved image spec, written into the artifact metadata. */
 function specHash(spec: ImageSpec, extra = ""): string {
   return createHash("sha256").update(JSON.stringify(spec) + extra, "utf8").digest("hex");
 }
 
 /**
- * Nhịp hỏi lại Redis khi đang chờ job.
+ * Polling interval for Redis while waiting on a job.
  *
- * 3 giây: đủ dày để client thấy tiến độ "sống", đủ thưa để 1 job 140 giây
- * chỉ tốn ~47 lần đọc Redis. Cũng là nhịp phát notifications/progress, nên
- * stream không bao giờ idle — quan trọng vì Cilium đặt
- * http-stream-idle-timeout=300s (đo 2026-09-12).
+ * 3 seconds: tight enough for the client to see "live" progress, loose
+ * enough that a 140-second job only costs ~47 Redis reads. It's also the
+ * cadence for emitting notifications/progress, so the stream is never
+ * idle — this matters because the network path in front of this service
+ * enforces an HTTP idle-stream timeout of around 300s (measured
+ * 2026-09-12), and a fully silent connection risks getting killed before
+ * the job finishes.
  */
 const WAIT_POLL_MS = 3_000;
 
@@ -101,8 +106,9 @@ export class ImagegenService {
     try {
       style = resolveStyle(styleIn.reference as string | undefined, extraStyle);
     } catch (e) {
-      // Style profile không tồn tại là lỗi NGƯỜI GỌI sửa được — nói rõ
-      // tên nào hợp lệ thay vì để nó thành "generation failed" mơ hồ.
+      // An unknown style profile is a CALLER-fixable error — spell out
+      // which names are valid instead of letting it become a vague
+      // "generation failed".
       throw new ImagegenError("UNKNOWN_STYLE_PROFILE", (e as Error).message);
     }
 
@@ -112,7 +118,7 @@ export class ImagegenService {
 
     const outputFormat = ((raw.output_format as OutputFormat) ?? "png") as OutputFormat;
     if (!(outputFormat in MIME_BY_FORMAT)) {
-      throw new ImagegenError("UNSUPPORTED_FORMAT", "output_format chỉ nhận png hoặc webp");
+      throw new ImagegenError("UNSUPPORTED_FORMAT", "output_format only accepts png or webp");
     }
 
     const compIn = (raw.composition ?? {}) as Record<string, unknown>;
@@ -126,13 +132,14 @@ export class ImagegenService {
       aspectRatio,
       width: (canvasIn.width as number | undefined) ?? defaults.width,
       height: (canvasIn.height as number | undefined) ?? defaults.height,
-      // Mặc định TRUE: artifact web hầu như luôn phải ghép lên nền khác,
-      // và nền trong suốt sai thành đục thì phải sinh lại từ đầu.
+      // Defaults to TRUE: a web artifact almost always has to be
+      // composited onto another background, and a transparent background
+      // that wrongly comes out opaque means regenerating from scratch.
       transparentBackground: (raw.transparent_background as boolean | undefined) ?? true,
       outputFormat,
       isolatedObject: (compIn.isolated_object as boolean | undefined) ?? true,
       safePaddingPercent: (compIn.safe_padding_percent as number | undefined) ?? 12,
-      // Tên file do WORKER quyết, không bao giờ lấy từ người dùng.
+      // The filename is decided by the WORKER, never taken from the user.
       filename: `artifact.${outputFormat}`,
     };
 
@@ -154,7 +161,7 @@ export class ImagegenService {
   }
 
   // ---------------------------------------------------------------
-  // edit_image — KHÔNG BAO GIỜ ghi đè (spec §11)
+  // edit_image — NEVER overwrites
   // ---------------------------------------------------------------
   async editImage(raw: Record<string, unknown>, principal: string): Promise<JobHandle> {
     await this.#checkRate(principal, this.#cfg.rateLimit.editImagePerHour, 3_600_000);
@@ -168,8 +175,8 @@ export class ImagegenService {
     if (!source?.artifact) {
       throw new ImagegenError(
         "JOB_NOT_FOUND",
-        `Không có artifact ${projectId}/${assetId}` +
-          (sourceVersion ? ` phiên bản ${sourceVersion}` : ""),
+        `No artifact ${projectId}/${assetId}` +
+          (sourceVersion ? ` version ${sourceVersion}` : ""),
       );
     }
 
@@ -211,30 +218,33 @@ export class ImagegenService {
   }
 
   // ---------------------------------------------------------------
-  // Truy vấn
+  // Queries
   // ---------------------------------------------------------------
   async getImageJob(jobId: string): Promise<Record<string, unknown>> {
     const job = await this.#store.get(jobId);
-    if (!job) throw new ImagegenError("JOB_NOT_FOUND", `Không có job ${jobId}`);
+    if (!job) throw new ImagegenError("JOB_NOT_FOUND", `No job ${jobId}`);
     return jobToResult(job);
   }
 
   /**
-   * Chờ job tới trạng thái cuối, BÁO TIẾN ĐỘ dọc đường.
+   * Waits for a job to reach a final state, REPORTING PROGRESS along the
+   * way.
    *
-   * *** VÌ SAO CẦN TOOL NÀY THAY VÌ ĐỂ CLIENT TỰ HỎI LẠI ***
-   * Sinh một ảnh mất 30-140 giây. Nếu client tự lặp get_image_job thì mỗi
-   * vòng là một lời gọi tool, model phải tự quyết chờ bao lâu, và người
-   * dùng nhìn màn hình không thấy gì đang xảy ra. Gom vào một lời gọi có
-   * phát `notifications/progress` thì client hiển thị được tiến độ thật.
+   * *** WHY THIS TOOL IS NEEDED INSTEAD OF LETTING THE CLIENT POLL ***
+   * Generating an image takes 30-140 seconds. If the client looped
+   * get_image_job itself, each round would be a separate tool call, the
+   * model would have to decide how long to wait, and the user would stare
+   * at a screen showing nothing happening. Folding it into one call that
+   * emits `notifications/progress` lets the client show real progress.
    *
-   * KHÔNG giữ trạng thái trong tiến trình: vẫn đọc Redis mỗi vòng, nên
-   * nhiều replica vẫn đúng. Cái duy nhất "dính" vào một pod là kết nối
-   * HTTP đang mở của chính lời gọi này.
+   * Holds NO state in the process: it still reads Redis every round, so
+   * multiple replicas stay correct. The only thing "stuck" to one pod is
+   * the open HTTP connection of this call itself.
    *
-   * Hết giờ KHÔNG phải lỗi: job vẫn chạy tiếp ở worker, chỉ là ta thôi
-   * chờ. Trả timed_out=true để client biết mà gọi lại — huỷ job ở đây sẽ
-   * phí một lượt quota ChatGPT đã tiêu.
+   * Timing out is NOT an error: the job keeps running on the worker, we
+   * just stop waiting. Returns timed_out=true so the client knows to call
+   * again — cancelling the job here would waste ChatGPT quota already
+   * spent.
    */
   async waitForImage(
     raw: Record<string, unknown>,
@@ -242,10 +252,11 @@ export class ImagegenService {
       signal?: AbortSignal;
       onProgress?: (info: { status: string; elapsedMs: number }) => void | Promise<void>;
       /**
-       * Nhịp hỏi lại, chỉ để TEST tiêm vào. KHÔNG phơi ra schema của tool:
-       * người gọi MCP không có lý do gì chỉnh nhịp đọc Redis của server.
-       * Test cần nó vì với nhịp 3 giây thật, một chuyển trạng thái diễn ra
-       * trong vài mili giây sẽ bị bỏ lỡ giữa hai lần lấy mẫu.
+       * Polling interval, injectable only for TESTS. NOT exposed in the
+       * tool's schema: an MCP caller has no reason to tune the server's
+       * Redis read cadence. Tests need it because with the real 3-second
+       * cadence, a state transition that happens within a few
+       * milliseconds would get missed between two samples.
        */
       pollMs?: number;
     } = {},
@@ -258,7 +269,7 @@ export class ImagegenService {
 
     for (;;) {
       const job = await this.#store.get(jobId);
-      if (!job) throw new ImagegenError("JOB_NOT_FOUND", `Không có job ${jobId}`);
+      if (!job) throw new ImagegenError("JOB_NOT_FOUND", `No job ${jobId}`);
 
       if (job.status !== last) {
         last = job.status;
@@ -269,7 +280,8 @@ export class ImagegenService {
         return { ...jobToResult(job), timed_out: false, waited_seconds: Math.round((Date.now() - started) / 1000) };
       }
 
-      // Client bỏ cuộc (đóng kết nối/huỷ request): dừng chờ, KHÔNG huỷ job.
+      // Client gave up (closed connection/cancelled request): stop waiting,
+      // do NOT cancel the job.
       if (opts.signal?.aborted) {
         return { ...jobToResult(job), timed_out: false, aborted: true, waited_seconds: Math.round((Date.now() - started) / 1000) };
       }
@@ -291,7 +303,7 @@ export class ImagegenService {
     if (!job) {
       throw new ImagegenError(
         "JOB_NOT_FOUND",
-        `Không có artifact ${projectId}/${assetId}` + (version ? ` v${version}` : ""),
+        `No artifact ${projectId}/${assetId}` + (version ? ` v${version}` : ""),
       );
     }
     return jobToResult(job);
@@ -299,12 +311,12 @@ export class ImagegenService {
 
   async cancelImageJob(jobId: string): Promise<Record<string, unknown>> {
     const job = await this.#store.get(jobId);
-    if (!job) throw new ImagegenError("JOB_NOT_FOUND", `Không có job ${jobId}`);
+    if (!job) throw new ImagegenError("JOB_NOT_FOUND", `No job ${jobId}`);
 
-    // Huỷ job đã xong KHÔNG được xoá artifact — phiên bản đã phát hành
-    // là bất biến (spec §11).
+    // Cancelling a finished job must NOT delete the artifact — a
+    // published version is immutable.
     if (job.status === "completed") {
-      throw new ImagegenError("JOB_CANCELLED", "Job đã hoàn tất, không huỷ được nữa.");
+      throw new ImagegenError("JOB_CANCELLED", "Job already completed, can no longer be cancelled.");
     }
 
     await this.#queue.requestCancel(jobId);
@@ -340,17 +352,18 @@ export class ImagegenService {
   }
 
   /**
-   * Rate limit đếm trong Redis chứ không trong bộ nhớ tiến trình.
+   * The rate limit counts in Redis, not in process memory.
    *
-   * Bắt buộc như vậy vì imagegen-mcp chạy NHIỀU replica: đếm cục bộ thì
-   * hạn mức thực tế nhân lên theo số replica, tức là không còn là hạn mức.
+   * This is required because imagegen-mcp runs MULTIPLE replicas: a local
+   * count would multiply the effective limit by the replica count, which
+   * means it's no longer a limit at all.
    */
   async #checkRate(principal: string, limit: number, windowMs: number): Promise<void> {
     const used = await this.#store.countSince(principal, Date.now() - windowMs);
     if (used >= limit) {
       throw new ImagegenError(
         "RATE_LIMITED",
-        `Vượt giới hạn ${limit} lần trong ${Math.round(windowMs / 60000)} phút.`,
+        `Exceeded the limit of ${limit} calls per ${Math.round(windowMs / 60000)} minutes.`,
       );
     }
   }

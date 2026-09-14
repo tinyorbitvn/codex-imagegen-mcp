@@ -11,10 +11,11 @@
     "sourceMap": true,
     "types": ["node"],
 
-    // Import nội bộ viết đuôi ".ts" là CÓ CHỦ ĐÍCH: test chạy thẳng file
-    // nguồn bằng `node --test --experimental-strip-types`, mà bộ
-    // strip-types của Node KHÔNG phân giải hộ đuôi. Hai cờ dưới cho phép
-    // điều đó nhưng vẫn emit được JS chạy production (tsc tự đổi .ts -> .js).
+    // Internal imports keep the ".ts" extension ON PURPOSE: tests run straight
+    // off the source files with `node --test --experimental-strip-types`, and
+    // Node's strip-types loader does NOT resolve a missing extension for you.
+    // The three flags below allow that while still emitting JS that runs in
+    // production (tsc rewrites .ts -> .js on the way out).
     "verbatimModuleSyntax": true,
     "allowImportingTsExtensions": true,
     "rewriteRelativeImportExtensions": true

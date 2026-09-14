@@ -1,29 +1,30 @@
-// Style profile dùng lại (spec §20).
+// Reusable style profiles.
 //
-// *** VÌ SAO TÁCH KHỎI PROMPT ***
-// Không tách thì mỗi lần gọi Claude phải chép lại nguyên đoạn mô tả
-// phong cách. Hai hệ quả xấu: (1) chép sai một chữ là artifact lệch bộ
-// nhận diện mà không ai nhận ra; (2) muốn đổi bảng màu thì phải sửa
-// trong từng đoạn hội thoại đã có, tức là không đổi được.
+// *** WHY THIS IS SEPARATE FROM THE PROMPT ***
+// Without this separation, every call would have Claude re-copy the whole
+// style description. Two bad consequences: (1) one mistyped word and the
+// artifact drifts off-brand without anyone noticing; (2) changing the
+// palette would require editing every conversation that already has the
+// description pasted in — i.e. it couldn't actually be changed.
 //
-// Có profile thì Claude chỉ gửi `style.reference: "tinyorbit-cloud-v1"`,
-// còn nội dung phong cách là nguồn sự thật nằm ở đây, trong git.
+// With a profile, Claude only sends `style.reference: "tinyorbit-cloud-v1"`,
+// and the style content itself is the source of truth living here, in git.
 //
-// Thêm profile mới = thêm một mục vào STYLE_PROFILES. Sửa profile đang
-// có sẽ ảnh hưởng tới MỌI artifact sinh ra SAU đó — artifact cũ giữ
-// nguyên vì chúng bất biến, và metadata của chúng ghi lại tên profile
-// đã dùng.
+// Adding a new profile = adding an entry to STYLE_PROFILES. Editing an
+// existing profile affects EVERY artifact generated AFTER the change —
+// existing artifacts stay as they are because they're immutable, and their
+// metadata records which profile name was used.
 
 export interface StyleProfile {
   name: string;
   description: string;
-  /** Đoạn văn nhúng vào prompt Codex. */
+  /** Text block embedded into the Codex prompt. */
   prompt: string;
 }
 
 const TINYORBIT_CLOUD_V1: StyleProfile = {
   name: "tinyorbit-cloud-v1",
-  description: "Bộ nhận diện 3D claymorphism của TinyOrbit Cloud",
+  description: "TinyOrbit Cloud's 3D claymorphism brand identity",
   prompt: [
     "3D illustration",
     "claymorphism",
@@ -64,14 +65,14 @@ export function listStyleProfiles(): string[] {
 }
 
 /**
- * Ghép phần phong cách cuối cùng.
+ * Assembles the final style section.
  *
- * Thứ tự CÓ Ý NGHĨA: profile trước, chỉ dẫn thêm của người gọi sau —
- * để một yêu cầu riêng lẻ tinh chỉnh được profile mà không phải bỏ hẳn
- * bộ nhận diện.
+ * The order MATTERS: profile first, caller's extra instructions after —
+ * so a single request can fine-tune the profile without dropping the
+ * brand identity altogether.
  *
- * Trả về chuỗi rỗng khi không có gì; bên gọi tự quyết bỏ qua mục này
- * trong prompt.
+ * Returns an empty string when there's nothing; the caller decides whether
+ * to skip this section in the prompt.
  */
 export function resolveStyle(
   reference: string | undefined,
@@ -84,7 +85,7 @@ export function resolveStyle(
     const profile = STYLE_PROFILES[reference];
     if (!profile) {
       throw new Error(
-        `Không có style profile "${reference}". Hiện có: ${listStyleProfiles().join(", ")}`,
+        `No style profile "${reference}". Available: ${listStyleProfiles().join(", ")}`,
       );
     }
     parts.push(profile.prompt);

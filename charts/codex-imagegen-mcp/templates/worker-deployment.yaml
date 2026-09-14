@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codex-imagegen-mcp.fullname" . }}-worker
+  labels:
+    {{- include "codex-imagegen-mcp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- if .Values.worker.persistence.codexHome.enabled }}
+  # The Codex volume is ReadWriteOnce, so the old pod has to let go before
+  # the new one can start. Rolling would deadlock on the volume.
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "codex-imagegen-mcp.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "codex-imagegen-mcp.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+        {{- with .Values.worker.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.worker.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "codex-imagegen-mcp.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: codex-image-worker
+          image: {{ include "codex-imagegen-mcp.image" (list . .Values.worker.image) }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: REDIS_URL
+              value: {{ include "codex-imagegen-mcp.redisUrl" . | quote }}
+            - name: WORKER_CONCURRENCY
+              value: {{ .Values.worker.concurrency | quote }}
+            - name: JOB_TIMEOUT_SECONDS
+              value: {{ .Values.worker.jobTimeoutSeconds | quote }}
+            - name: GENERATED_IMAGE_RETENTION_HOURS
+              value: {{ .Values.worker.generatedImageRetentionHours | quote }}
+            - name: CODEX_HOME
+              value: /home/codex/.codex
+            - name: WORK_DIR
+              value: /work/jobs
+            - name: S3_ENDPOINT
+              value: {{ .Values.s3.endpoint | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: S3_REGION
+              value: {{ .Values.s3.region | quote }}
+            - name: S3_FORCE_PATH_STYLE
+              value: {{ .Values.s3.forcePathStyle | quote }}
+            - name: S3_PUBLIC_BASE_URL
+              value: {{ .Values.s3.publicBaseUrl | quote }}
+            - name: S3_SIGNED_URL_TTL_SECONDS
+              value: {{ .Values.s3.signedUrlTtlSeconds | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codex-imagegen-mcp.s3SecretName" . }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codex-imagegen-mcp.s3SecretName" . }}
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otlp.endpoint | quote }}
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: codex-home
+              mountPath: /home/codex/.codex
+            - name: work
+              mountPath: /work/jobs
+      volumes:
+        - name: codex-home
+          {{- if .Values.worker.persistence.codexHome.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.worker.persistence.codexHome.existingClaim | default (printf "%s-codex-home" (include "codex-imagegen-mcp.fullname" .)) }}
+          {{- else }}
+          # No volume means the sign-in is lost on every restart. Only
+          # sensible for a throwaway test.
+          emptyDir: {}
+          {{- end }}
+        - name: work
+          {{- if .Values.worker.persistence.work.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.worker.persistence.work.existingClaim | default (printf "%s-work" (include "codex-imagegen-mcp.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

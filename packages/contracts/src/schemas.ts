@@ -1,13 +1,14 @@
-// Hợp đồng MCP tool (spec §11).
+// MCP tool contract.
 //
-// *** HƯỚNG ARTIFACT, KHÔNG PHẢI generate_image(prompt) ***
-// Mỗi yêu cầu gắn với một artifact có danh tính (`project_id` +
-// `asset_id`) chứ không phải một lời nhắc trôi nổi. Nhờ vậy mới có
-// phiên bản, mới sửa lại được, và Claude mới tham chiếu lại được cùng
-// một vật thể ở lượt sau.
+// *** ARTIFACT-ORIENTED, NOT generate_image(prompt) ***
+// Every request is tied to an artifact with an identity (`project_id` +
+// `asset_id`), not a free-floating prompt. That's what gives us
+// versioning, the ability to edit again, and lets Claude reference the
+// same object again in a later turn.
 //
-// Dùng zod vì MCP SDK nhận zod shape và tự sinh JSON Schema cho
-// tools/list — một nguồn sự thật, không viết schema hai lần rồi lệch.
+// Using zod because the MCP SDK accepts a zod shape and auto-generates the
+// JSON Schema for tools/list — one source of truth, no schema written
+// twice and left to drift.
 
 import { z } from "zod";
 
@@ -18,10 +19,11 @@ export const OUTPUT_FORMATS = ["png", "webp"] as const;
 export type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 
 /**
- * Kích thước mặc định theo tỉ lệ.
+ * Default dimensions per aspect ratio.
  *
- * Bám quanh cạnh dài 1536 — kích thước mà mô hình ảnh của OpenAI sinh
- * gọn nhất. Đặt số lẻ lung tung thì ảnh bị scale lại và mất nét.
+ * Kept close to a 1536 long edge — the size OpenAI's image model generates
+ * most cleanly. Pick arbitrary odd numbers and the image gets rescaled and
+ * loses sharpness.
  */
 export const DEFAULT_CANVAS: Record<AspectRatio, { width: number; height: number }> = {
   "1:1": { width: 1536, height: 1536 },
@@ -31,32 +33,33 @@ export const DEFAULT_CANVAS: Record<AspectRatio, { width: number; height: number
   "9:16": { width: 864, height: 1536 },
 };
 
-// Trần kích thước: chặn một yêu cầu 20000x20000 làm Codex chạy vô tận
-// rồi đụng timeout, tốn quota mà không ra gì.
+// Dimension cap: stops a 20000x20000 request from making Codex run forever
+// and hit the timeout, burning quota for nothing.
 const dimension = z.number().int().min(256).max(4096);
 
 export const createImageSchema = {
   project_id: z
     .string()
-    .describe('Mã dự án, ví dụ "tinyorbit-cloud". Chỉ a-z, 0-9, "-", "_".'),
+    .describe('Project id, e.g. "tinyorbit-cloud". a-z, 0-9, "-", "_" only.'),
   asset_id: z
     .string()
-    .describe('Mã artifact trong dự án, ví dụ "homepage-hero-vps".'),
-  description: z.string().describe("Mô tả vật thể cần vẽ."),
+    .describe('Artifact id within the project, e.g. "homepage-hero-vps".'),
+  description: z.string().describe("Description of the subject to draw."),
   style: z
     .object({
       reference: z
         .string()
         .optional()
         .describe(
-          'Tên style profile dùng lại, ví dụ "tinyorbit-cloud-v1". ' +
-            "Ưu tiên dùng cái này thay vì chép cả đoạn mô tả phong cách " +
-            "vào mỗi lần gọi — style profile là nguồn sự thật của bộ nhận diện.",
+          'Name of a reusable style profile, e.g. "tinyorbit-cloud-v1". ' +
+            "Prefer this over copying the whole style description into " +
+            "every call — the style profile is the source of truth for " +
+            "the brand identity.",
         ),
       prompt: z
         .string()
         .optional()
-        .describe("Chỉ dẫn phong cách thêm, ghép SAU style profile."),
+        .describe("Extra style instructions, appended AFTER the style profile."),
     })
     .optional(),
   canvas: z
@@ -70,8 +73,9 @@ export const createImageSchema = {
     .boolean()
     .optional()
     .describe(
-      "true thì nền trong suốt (kênh alpha). Mặc định true vì artifact " +
-        "web hầu như luôn cần ghép lên nền khác.",
+      "true for a transparent background (alpha channel). Defaults to " +
+        "true because a web artifact almost always needs to be composited " +
+        "onto another background.",
     ),
   output_format: z.enum(OUTPUT_FORMATS).optional(),
   composition: z
@@ -80,9 +84,10 @@ export const createImageSchema = {
         .boolean()
         .optional()
         .describe(
-          "true thì CHỈ vẽ đúng một vật, không có vật nào khác trong khung. " +
-            "Bắt buộc bật khi định cho các vật chuyển động độc lập trên web " +
-            "— mỗi vật phải là một artifact riêng, xem mô tả của tool.",
+          "true means draw EXACTLY one object, nothing else in the frame. " +
+            "Must be enabled when objects are meant to move independently " +
+            "on the web page — each object must be its own artifact, see " +
+            "the tool description.",
         ),
       safe_padding_percent: z.number().int().min(0).max(40).optional(),
     })
@@ -91,9 +96,11 @@ export const createImageSchema = {
     .boolean()
     .optional()
     .describe(
-      "Mặc định true: CHỜ tới khi ảnh xong rồi mới trả về, và báo tiến độ " +
-        "dọc đường qua notifications/progress. Đặt false để trả job_id ngay " +
-        "rồi tự hỏi get_image_job — chỉ nên dùng khi muốn chạy nhiều job song song.",
+      "Defaults to true: WAIT until the image is done before returning, " +
+        "reporting progress along the way via notifications/progress. Set " +
+        "to false to get a job_id back immediately and poll " +
+        "get_image_job yourself — only use this when running several jobs " +
+        "in parallel.",
     ),
   timeout_seconds: z
     .number()
@@ -102,14 +109,15 @@ export const createImageSchema = {
     .max(600)
     .optional()
     .describe(
-      "Chỉ có tác dụng khi wait=true. Chờ tối đa bao lâu, mặc định 300. " +
-        "Hết giờ KHÔNG phải lỗi và KHÔNG huỷ job: trả trạng thái hiện tại " +
-        "kèm timed_out=true, gọi get_image_job(job_id) để theo tiếp.",
+      "Only has an effect when wait=true. Maximum wait time, defaults to " +
+        "300. Timing out is NOT an error and does NOT cancel the job: the " +
+        "current status is returned with timed_out=true — call " +
+        "get_image_job(job_id) to keep following it.",
     ),
 };
 
 export const getImageJobSchema = {
-  job_id: z.string().describe("job_id do create_image hoặc edit_image trả về."),
+  job_id: z.string().describe("job_id returned by create_image or edit_image."),
 };
 
 export const editImageSchema = {
@@ -120,16 +128,18 @@ export const editImageSchema = {
     .int()
     .min(1)
     .optional()
-    .describe("Phiên bản nguồn. Bỏ trống = phiên bản mới nhất."),
-  instructions: z.string().describe("Thay đổi cần áp dụng."),
+    .describe("Source version. Omit for the latest version."),
+  instructions: z.string().describe("The change to apply."),
   transparent_background: z.boolean().optional(),
   wait: z
     .boolean()
     .optional()
     .describe(
-      "Mặc định true: CHỜ tới khi ảnh xong rồi mới trả về, và báo tiến độ " +
-        "dọc đường qua notifications/progress. Đặt false để trả job_id ngay " +
-        "rồi tự hỏi get_image_job — chỉ nên dùng khi muốn chạy nhiều job song song.",
+      "Defaults to true: WAIT until the image is done before returning, " +
+        "reporting progress along the way via notifications/progress. Set " +
+        "to false to get a job_id back immediately and poll " +
+        "get_image_job yourself — only use this when running several jobs " +
+        "in parallel.",
     ),
   timeout_seconds: z
     .number()
@@ -138,23 +148,24 @@ export const editImageSchema = {
     .max(600)
     .optional()
     .describe(
-      "Chỉ có tác dụng khi wait=true. Chờ tối đa bao lâu, mặc định 300. " +
-        "Hết giờ KHÔNG phải lỗi và KHÔNG huỷ job: trả trạng thái hiện tại " +
-        "kèm timed_out=true, gọi get_image_job(job_id) để theo tiếp.",
+      "Only has an effect when wait=true. Maximum wait time, defaults to " +
+        "300. Timing out is NOT an error and does NOT cancel the job: the " +
+        "current status is returned with timed_out=true — call " +
+        "get_image_job(job_id) to keep following it.",
     ),
 };
 
 export const getArtifactSchema = {
   project_id: z.string(),
   asset_id: z.string(),
-  version: z.number().int().min(1).optional().describe("Bỏ trống = bản mới nhất."),
+  version: z.number().int().min(1).optional().describe("Omit for the latest version."),
 };
 
 export const cancelImageJobSchema = {
   job_id: z.string(),
 };
 
-/** Tên 5 tool mà Claude Design được thấy (spec §9, §30). */
+/** Names of the 5 tools Claude Design gets to see. */
 export const PUBLIC_TOOLS = [
   "create_image",
   "edit_image",

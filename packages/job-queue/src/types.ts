@@ -1,21 +1,21 @@
-// Trừu tượng hàng đợi + kho trạng thái job.
+// Job queue + status store abstraction.
 //
-// *** VÌ SAO CÓ LỚP TRỪU TƯỢNG NÀY (spec §13) ***
-// Redis là lựa chọn hiện tại, không phải lựa chọn vĩnh viễn. Hai
-// interface dưới đây là toàn bộ thứ mà imagegen-mcp và
-// codex-image-worker được phép biết; đổi sang Postgres/NATS/SQS sau này
-// chỉ phải viết một lớp cài đặt mới, không đụng vào nghiệp vụ.
+// *** WHY THIS ABSTRACTION LAYER EXISTS ***
+// Redis is the current choice, not a permanent one. The two interfaces
+// below are the entirety of what imagegen-mcp and codex-image-worker are
+// allowed to know; switching to Postgres/NATS/SQS later only means writing
+// one new implementation, without touching business logic.
 //
-// Đây KHÔNG phải trừu tượng hoá sớm vô cớ: spec nói rõ "Keep the
-// implementation abstract enough that Redis is replaceable later", và
-// chi phí ở đây đúng bằng hai interface.
+// This is NOT premature abstraction for its own sake: keeping Redis
+// replaceable is a deliberate goal, and the cost of that here is exactly
+// two interfaces.
 
 import type { JobPayload, JobRecord, JobStatus, ArtifactRef } from "@tinyorbit/contracts";
 
 /**
- * Kho trạng thái job. PHẢI bền qua restart (spec §30): khởi động lại
- * imagegen-mcp / worker / gateway không được làm mất metadata artifact
- * của job đã hoàn tất.
+ * Job status store. MUST be durable across restarts: restarting
+ * imagegen-mcp / worker / gateway must not lose the artifact metadata of a
+ * completed job.
  */
 export interface JobStore {
   create(job: JobRecord): Promise<void>;
@@ -24,49 +24,51 @@ export interface JobStore {
   markRunning(jobId: string): Promise<void>;
   markCompleted(jobId: string, artifact: ArtifactRef): Promise<void>;
   markFailed(jobId: string, code: string, message: string): Promise<void>;
-  /** Trả false nếu job đã ở trạng thái cuối (không huỷ ngược được). */
+  /** Returns false if the job is already in a terminal state (can't cancel back out of it). */
   markCancelled(jobId: string): Promise<boolean>;
 
   /**
-   * Phiên bản cao nhất ĐÃ CẤP PHÁT cho một artifact, kể cả job đang
-   * chạy. Cấp số mới phải dựa vào đây chứ KHÔNG phải phiên bản đã hoàn
-   * tất — nếu không, hai job song song trên cùng asset cùng nhận một số
-   * và job sau ghi đè job trước trên object storage.
+   * Highest version number ALREADY ALLOCATED for an artifact, including a
+   * job that's still running. Allocating a new number must be based on
+   * this, NOT on the highest completed version — otherwise two parallel
+   * jobs on the same asset get handed the same number and the later one
+   * overwrites the earlier one in object storage.
    */
   highestAllocatedVersion(projectId: string, assetId: string): Promise<number>;
 
-  /** Bỏ trống `version` = bản hoàn tất mới nhất. */
+  /** Omit `version` for the latest completed version. */
   getArtifact(
     projectId: string,
     assetId: string,
     version?: number,
   ): Promise<JobRecord | null>;
 
-  /** Đếm job của một chủ thể từ mốc thời gian — phục vụ rate limit. */
+  /** Counts a principal's jobs since a timestamp — used for rate limiting. */
   countSince(principal: string, sinceMs: number): Promise<number>;
 
   close(): Promise<void>;
 }
 
-/** Hàng đợi việc giữa imagegen-mcp (producer) và worker (consumer). */
+/** Work queue between imagegen-mcp (producer) and the worker (consumer). */
 export interface JobQueue {
-  /** Đẩy việc vào hàng đợi. Ném RATE_LIMITED khi hàng đợi đã đầy. */
+  /** Pushes work onto the queue. Throws RATE_LIMITED when the queue is already full. */
   enqueue(payload: JobPayload): Promise<void>;
 
   /**
-   * Chờ lấy một việc. Trả null khi hết `timeoutMs` mà không có việc —
-   * để vòng lặp consumer còn kiểm tín hiệu dừng thay vì chặn vĩnh viễn.
+   * Waits to claim a piece of work. Returns null once `timeoutMs` elapses
+   * with nothing available — so the consumer loop can still check a stop
+   * signal instead of blocking forever.
    */
   dequeue(timeoutMs: number): Promise<JobPayload | null>;
 
-  /** Báo job đã xử lý xong để hàng đợi bỏ nó khỏi danh sách đang chạy. */
+  /** Reports a job as done processing so the queue drops it from the running list. */
   ack(jobId: string): Promise<void>;
 
-  /** Đặt cờ huỷ. Worker đọc cờ này giữa các chặng và khi chạy Codex. */
+  /** Sets the cancellation flag. The worker reads this flag between stages and while running Codex. */
   requestCancel(jobId: string): Promise<void>;
   isCancelled(jobId: string): Promise<boolean>;
 
-  /** Số việc đang chờ — cho metric và cho ngưỡng từ chối. */
+  /** Number of jobs pending — used for metrics and for the rejection threshold. */
   depth(): Promise<number>;
 
   close(): Promise<void>;

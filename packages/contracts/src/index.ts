@@ -1,7 +1,7 @@
-// Barrel của gói contracts — thứ DUY NHẤT hai service import từ đây.
+// Barrel of the contracts package — the ONE thing both services import from.
 //
-// Giữ một cửa xuất khẩu giúp đổi bố cục file bên trong mà không phải
-// sửa import ở service.
+// Keeping a single export gate means the internal file layout can change
+// without touching imports in either service.
 export * from "./errors.ts";
 export * from "./job.ts";
 export * from "./logger.ts";

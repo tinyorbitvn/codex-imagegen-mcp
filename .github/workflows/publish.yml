@@ -1,15 +1,16 @@
-# Build và đẩy hai ảnh service lên GitHub Packages (ghcr.io) khi đẩy tag `v*`.
+# Build both service images and publish them to GitHub Packages (ghcr.io),
+# then cut a GitHub Release, whenever a `v*` tag is pushed.
 #
-# Vì sao chỉ chạy theo tag chứ không theo mỗi push: ảnh ở đây là thứ cụm kéo về
-# chạy thật, nên mỗi ảnh phải ứng với một phiên bản gọi được tên. Muốn thử nhanh
-# thì build tại chỗ, đừng đẻ tag rác trên registry công khai.
+# Why tags only, and not every push: these images are what the cluster actually
+# runs, so every image must correspond to a version you can name. For quick
+# experiments build locally instead of littering a public registry with tags.
 #
-# Cả hai ảnh dùng CHUNG số phiên bản của tag: đây là một workspace npm, hai
-# service chia nhau packages/*, tách phiên bản ra thì không nói được "bản nào đi
-# với bản nào".
+# Both images carry the SAME version as the tag. This is one npm workspace and
+# the two services share `packages/*`, so splitting their versions would make it
+# impossible to say which build of one goes with which build of the other.
 #
-# Build context là GỐC repo (không phải thư mục service) vì Dockerfile COPY cả
-# packages/ — xem comment trong chính Dockerfile.
+# The build context is the REPOSITORY ROOT, not the service directory, because
+# each Dockerfile copies `packages/` as well. See the comments in the Dockerfiles.
 name: Publish
 
 on:
@@ -26,7 +27,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     strategy:
-      # Hai ảnh độc lập nhau: một cái hỏng không nên chặn cái kia publish.
+      # The two images are independent: one failing should not stop the other
+      # from being published.
       fail-fast: false
       matrix:
         service:
@@ -35,9 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Lấy số phiên bản từ tag
+      - name: Derive version from tag
         id: ver
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -47,18 +51,74 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build và đẩy ${{ matrix.service }}
+      - name: Build and push ${{ matrix.service }}
         uses: docker/build-push-action@v6
         with:
-          # Gốc repo, KHÔNG phải services/<tên>
+          # Repository root, not services/<name>.
           context: .
           file: services/${{ matrix.service }}/Dockerfile
           push: true
-          # BASE_REGISTRY để mặc định (docker.io/library): runner công khai
-          # không đi qua được hạ tầng nội bộ, và cũng không nên đi.
+          # BASE_REGISTRY keeps its default (docker.io/library): a public runner
+          # cannot reach TinyOrbit's internal registry, and should not try to.
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ steps.ver.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:latest
-          # Cache giữa các lần chạy để build lại chỉ tốn vài phút.
+          # Cache between runs so a rebuild costs minutes, not tens of minutes.
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  release:
+    # Only cut a release once both images are actually on the registry, so the
+    # pull commands in the release notes are never a lie.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the previous tag can be found for the changelog.
+          fetch-depth: 0
+
+      - name: Write release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          version="${TAG#v}"
+          previous="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          {
+            echo "## Container images"
+            echo
+            echo "Both images are public — no login needed to pull them."
+            echo
+            echo '```bash'
+            echo "docker pull ghcr.io/${OWNER}/imagegen-mcp:${version}"
+            echo "docker pull ghcr.io/${OWNER}/codex-image-worker:${version}"
+            echo '```'
+            echo
+            echo "They share one version on purpose: both services live in a single npm"
+            echo "workspace and depend on the same \`packages/*\`, so a matching pair is"
+            echo "the only combination that is tested together."
+            echo
+            echo "## Changes"
+            echo
+            if [ -n "$previous" ]; then
+              git log --no-merges --pretty='- %s (%h)' "${previous}..${TAG}"
+              echo
+              echo "Full diff: https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...${TAG}"
+            else
+              echo "First release cut from this repository."
+            fi
+          } > release-notes.md
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md
+          fi

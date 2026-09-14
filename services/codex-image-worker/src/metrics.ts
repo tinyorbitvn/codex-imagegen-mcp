@@ -1,7 +1,8 @@
-// Metric dạng Prometheus text, phơi ở /metrics (spec §31).
+// Prometheus text-format metrics, exposed at /metrics.
 //
-// Tự viết thay vì kéo prom-client: chỉ cần 6 metric, và mỗi dependency
-// thêm vào image là thêm một thứ phải vá khi có CVE.
+// Hand-rolled instead of pulling in prom-client: we only need 6 metrics,
+// and every dependency added to the image is one more thing to patch
+// when a CVE shows up.
 
 interface Histogram {
   buckets: Map<number, number>;
@@ -60,18 +61,18 @@ class Metrics {
 
   render(): string {
     return [
-      "# HELP imagegen_jobs_total Tổng số job sinh ảnh đã nhận",
+      "# HELP imagegen_jobs_total Total number of image-generation jobs received",
       "# TYPE imagegen_jobs_total counter",
       `imagegen_jobs_total ${this.jobsTotal}`,
-      "# HELP imagegen_jobs_running Số job đang chạy",
+      "# HELP imagegen_jobs_running Number of jobs currently running",
       "# TYPE imagegen_jobs_running gauge",
       `imagegen_jobs_running ${this.jobsRunning}`,
-      "# HELP imagegen_jobs_failed_total Tổng số job thất bại",
+      "# HELP imagegen_jobs_failed_total Total number of failed jobs",
       "# TYPE imagegen_jobs_failed_total counter",
       `imagegen_jobs_failed_total ${this.jobsFailedTotal}`,
-      renderHistogram("imagegen_job_duration_seconds", "Thời gian trọn một job", this.jobDuration),
-      renderHistogram("codex_process_duration_seconds", "Thời gian chạy tiến trình Codex", this.codexDuration),
-      renderHistogram("artifact_upload_duration_seconds", "Thời gian đẩy artifact lên S3", this.uploadDuration),
+      renderHistogram("imagegen_job_duration_seconds", "Time to complete one job", this.jobDuration),
+      renderHistogram("codex_process_duration_seconds", "Time spent running the Codex process", this.codexDuration),
+      renderHistogram("artifact_upload_duration_seconds", "Time spent uploading the artifact to S3", this.uploadDuration),
       "",
     ].join("\n");
   }

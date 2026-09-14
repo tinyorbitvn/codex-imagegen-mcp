@@ -1,17 +1,17 @@
-// Khởi động OpenTelemetry (spec §22).
+// Start OpenTelemetry.
 //
-// Cụm đã có sẵn alloy-traces nhận OTLP ở observability — chart trỏ thẳng
-// vào đó, KHÔNG dựng collector mới (spec §33 mục 2: kiểm thứ đã có trước
-// khi thêm bản sao).
+// Point this at whatever OTLP collector you already run rather than
+// standing up a new one just for this service.
 //
-// Endpoint rỗng thì tắt hẳn: chạy local hoặc test không cần nó, và một
-// exporter trỏ vào hư không sẽ nhả log lỗi mỗi vài giây.
+// An empty endpoint disables it entirely: running locally or under test
+// doesn't need it, and an exporter pointed at nothing would spam error
+// logs every few seconds.
 
 import { log } from "@tinyorbit/contracts";
 
 export async function startTelemetry(serviceName: string, endpoint: string): Promise<void> {
   if (!endpoint) {
-    log.info("OTLP tắt (OTEL_EXPORTER_OTLP_ENDPOINT rỗng)", { service: serviceName });
+    log.info("OTLP disabled (OTEL_EXPORTER_OTLP_ENDPOINT is empty)", { service: serviceName });
     return;
   }
   try {
@@ -22,10 +22,10 @@ export async function startTelemetry(serviceName: string, endpoint: string): Pro
       traceExporter: new OTLPTraceExporter({ url: `${endpoint}/v1/traces` }),
     });
     sdk.start();
-    log.info("OTLP đã bật", { service: serviceName, endpoint });
+    log.info("OTLP enabled", { service: serviceName, endpoint });
   } catch (err) {
-    // Telemetry hỏng KHÔNG được làm service không khởi động nổi — quan
-    // sát được là thứ tốt để có, không phải điều kiện để chạy.
-    log.warn("không bật được OTLP, service vẫn chạy", { service: serviceName, err });
+    // A broken telemetry setup must NOT stop the service from starting —
+    // observability is nice to have, not a condition for running.
+    log.warn("failed to enable OTLP, service still running", { service: serviceName, err });
   }
 }

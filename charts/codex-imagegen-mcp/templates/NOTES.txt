@@ -1,0 +1,36 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as release {{ .Release.Name }}.
+
+The MCP endpoint is:
+
+  http://{{ include "codex-imagegen-mcp.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.mcp.service.port }}/mcp
+
+{{ if .Values.ingress.enabled }}From outside the cluster:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}/mcp
+{{- end }}
+{{ else }}Try it from your machine with a port-forward:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "codex-imagegen-mcp.fullname" . }} 8080:{{ .Values.mcp.service.port }}
+{{ end }}
+ONE STEP IS LEFT. The worker cannot generate anything until it has a Codex
+sign-in, and no image ships with credentials. Sign in once, into the
+worker's volume:
+
+  kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "codex-imagegen-mcp.fullname" . }}-worker -- codex login --device-auth
+
+Follow the printed URL and code, then restart the worker:
+
+  kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "codex-imagegen-mcp.fullname" . }}-worker
+
+Check it took:
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "codex-imagegen-mcp.fullname" . }}-worker -- codex login status
+{{- if .Values.redis.deploy }}
+
+WARNING: redis.deploy=true runs a single Redis pod with no persistence.
+A restart drops the queue and every job waiting in it.
+{{- end }}
+
+Anything that can reach /mcp can spend your ChatGPT quota. The service does
+no authentication of its own: put an authenticating proxy in front before
+exposing it.

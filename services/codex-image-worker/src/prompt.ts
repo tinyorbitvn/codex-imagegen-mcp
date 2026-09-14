@@ -1,23 +1,23 @@
-// Dựng chỉ dẫn cho Codex (spec §18).
+// Builds the instructions handed to Codex.
 //
-// *** ĐIỂM QUAN TRỌNG NHẤT CỦA FILE NÀY ***
-// Đầu vào MCP KHÔNG PHẢI là prompt gửi cho Codex. Worker mới là bên
-// soạn chỉ dẫn; dữ liệu của người dùng chỉ được nhúng vào những ô đã
-// định sẵn.
+// *** THE MOST IMPORTANT POINT IN THIS FILE ***
+// The MCP input is NOT the prompt sent to Codex. The worker is the party
+// that writes the instructions; user data is only ever embedded into
+// slots that are already predefined.
 //
-// Vì sao: Codex là một agent lập trình, không phải một hàm sinh ảnh.
-// Chuyển thẳng chuỗi người dùng thành prompt là trao cho bên gọi khả
-// năng sai khiến nó làm việc khác — đọc file, chạy lệnh, sửa mã nguồn.
-// Khoá phạm vi lại là việc của worker. Spec §18 nói gọn: "Treat prompts
-// as data."
+// Why: Codex is a coding agent, not an image-generation function. Passing
+// the user's string straight through as the prompt would hand the caller
+// the ability to make it do something else entirely — read files, run
+// commands, modify source code. Locking down the scope is the worker's
+// job: treat prompts as data, never as instructions.
 //
-// Đặc biệt: MỌI chỉ dẫn về hệ thống file đều do worker viết. Người dùng
-// không bao giờ nêu được đường dẫn đầu ra.
+// In particular: EVERY instruction about the filesystem is written by the
+// worker. The user can never specify the output path.
 
 import { createHash } from "node:crypto";
 import type { ImageSpec } from "@tinyorbit/contracts";
 
-/** Chỉ dẫn sinh ảnh mới. Trả về MỘT chuỗi, đi vào argv như một phần tử. */
+/** Instructions for generating a new image. Returns ONE string, passed into argv as a single element. */
 export function buildCreatePrompt(spec: ImageSpec, outputDir: string): string {
   const lines: string[] = [
     "Generate exactly one image artifact according to this specification.",
@@ -54,9 +54,9 @@ export function buildCreatePrompt(spec: ImageSpec, outputDir: string): string {
     lines.push("- opaque background");
   }
   if (spec.isolatedObject) {
-    // Đây là điều kiện để ghép animation sau này (spec §21): mỗi vật
-    // phải đứng một mình trên nền trong suốt thì mới cho chuyển động
-    // độc lập bằng CSS/Framer Motion được.
+    // This is a precondition for compositing animation later: each object
+    // must stand alone on a transparent background for it to be animated
+    // independently with CSS/Framer Motion.
     lines.push(
       "- isolated object: render ONLY the requested subject",
       "- no neighboring objects, no background scene, no props",
@@ -67,27 +67,29 @@ export function buildCreatePrompt(spec: ImageSpec, outputDir: string): string {
     `- keep at least ${spec.safePaddingPercent}% safe padding on every side`,
     "- no text unless explicitly requested",
     "",
-    // Chỉ dẫn hệ thống file: worker viết, worker cấp đường dẫn.
+    // Filesystem instruction: written by the worker, path supplied by the worker.
     `Save the final generated asset to exactly this path: ${outputDir}/${spec.filename}`,
     "Do not write any other file.",
-    // *** VÌ SAO CÂU NÀY PHẢI CÓ NGOẠI LỆ ***
-    // Công cụ sinh ảnh của Codex KHÔNG ghi thẳng vào thư mục làm việc:
-    // nó lưu vào $CODEX_HOME/generated_images/<phiên>/ rồi Codex mới
-    // chép sang chỗ ta yêu cầu. Bản cũ chỉ có một câu cấm trơn "Do not
-    // read or modify anything outside that directory." — và Codex tuân
-    // thủ đúng câu đó, nên nó TỪ CHỐI chép chính tấm ảnh nó vừa sinh.
+    // *** WHY THIS SENTENCE NEEDS AN EXCEPTION ***
+    // Codex's image-generation tool does NOT write directly into the
+    // working directory: it saves into $CODEX_HOME/generated_images/<session>/
+    // and only then does Codex copy it to the path we requested. The old
+    // version had only a bare prohibition, "Do not read or modify
+    // anything outside that directory." — and Codex obeyed it to the
+    // letter, so it REFUSED to copy the very image it had just generated.
     //
-    // Nguyên văn Codex trả lời trong session log 2026-09-12:
+    // Codex's verbatim reply from the session log on 2026-09-12:
     //   "Generated one blue cloud icon, but the image tool saved it
     //    outside your permitted directory. I couldn't copy it to
     //    artifact.png without violating your restriction on reading
     //    outside that directory."
-    // Rồi nó THOÁT MÃ 0 — hỏng câm. Mỗi lần như vậy là một lượt quota
-    // ChatGPT đã trả tiền bị vứt đi; đếm được 9 PNG mồ côi trong
-    // generated_images/.
+    // Then it EXITED CODE 0 — a silent failure. Every time this happens,
+    // one already-paid-for unit of ChatGPT quota gets thrown away; we
+    // counted 9 orphaned PNGs in generated_images/.
     //
-    // Nên câu cấm giữ nguyên tinh thần, nhưng nêu rõ MỘT ngoại lệ: đọc
-    // và chép lại sản phẩm của chính công cụ sinh ảnh.
+    // So the prohibition keeps its original intent, but now spells out
+    // ONE exception: reading and copying back the image-generation tool's
+    // own output.
     "You may read the image-generation tool's own output directory and copy the generated image from there to the path above; that is expected.",
     "Apart from that, do not read or modify anything outside that directory.",
     "Do not perform unrelated tasks.",
@@ -96,7 +98,7 @@ export function buildCreatePrompt(spec: ImageSpec, outputDir: string): string {
   return lines.join("\n");
 }
 
-/** Chỉ dẫn sửa ảnh. Ảnh nguồn do worker tải sẵn vào thư mục job. */
+/** Instructions for editing an image. The source image was already downloaded by the worker into the job directory. */
 export function buildEditPrompt(
   spec: ImageSpec,
   instructions: string,
@@ -125,24 +127,26 @@ export function buildEditPrompt(
     `Save the edited artifact to exactly this path: ${outputDir}/${spec.filename}`,
     "Do not overwrite the source image.",
     "Do not write any other file.",
-    // *** VÌ SAO CÂU NÀY PHẢI CÓ NGOẠI LỆ ***
-    // Công cụ sinh ảnh của Codex KHÔNG ghi thẳng vào thư mục làm việc:
-    // nó lưu vào $CODEX_HOME/generated_images/<phiên>/ rồi Codex mới
-    // chép sang chỗ ta yêu cầu. Bản cũ chỉ có một câu cấm trơn "Do not
-    // read or modify anything outside that directory." — và Codex tuân
-    // thủ đúng câu đó, nên nó TỪ CHỐI chép chính tấm ảnh nó vừa sinh.
+    // *** WHY THIS SENTENCE NEEDS AN EXCEPTION ***
+    // Codex's image-generation tool does NOT write directly into the
+    // working directory: it saves into $CODEX_HOME/generated_images/<session>/
+    // and only then does Codex copy it to the path we requested. The old
+    // version had only a bare prohibition, "Do not read or modify
+    // anything outside that directory." — and Codex obeyed it to the
+    // letter, so it REFUSED to copy the very image it had just generated.
     //
-    // Nguyên văn Codex trả lời trong session log 2026-09-12:
+    // Codex's verbatim reply from the session log on 2026-09-12:
     //   "Generated one blue cloud icon, but the image tool saved it
     //    outside your permitted directory. I couldn't copy it to
     //    artifact.png without violating your restriction on reading
     //    outside that directory."
-    // Rồi nó THOÁT MÃ 0 — hỏng câm. Mỗi lần như vậy là một lượt quota
-    // ChatGPT đã trả tiền bị vứt đi; đếm được 9 PNG mồ côi trong
-    // generated_images/.
+    // Then it EXITED CODE 0 — a silent failure. Every time this happens,
+    // one already-paid-for unit of ChatGPT quota gets thrown away; we
+    // counted 9 orphaned PNGs in generated_images/.
     //
-    // Nên câu cấm giữ nguyên tinh thần, nhưng nêu rõ MỘT ngoại lệ: đọc
-    // và chép lại sản phẩm của chính công cụ sinh ảnh.
+    // So the prohibition keeps its original intent, but now spells out
+    // ONE exception: reading and copying back the image-generation tool's
+    // own output.
     "You may read the image-generation tool's own output directory and copy the generated image from there to the path above; that is expected.",
     "Apart from that, do not read or modify anything outside that directory.",
     "Do not perform unrelated tasks.",
@@ -150,11 +154,12 @@ export function buildEditPrompt(
 }
 
 /**
- * Vân tay của đặc tả, ghi vào metadata artifact (spec §19).
+ * Fingerprint of the spec, written into the artifact's metadata.
  *
- * Băm chứ không lưu nguyên văn: metadata nằm cạnh ảnh trong bucket, nên
- * đặc tả nguyên văn ở đó là rò rỉ nội dung công việc. Bản băm vẫn đủ để
- * đối chiếu "hai ảnh này sinh từ cùng một đặc tả".
+ * Hashed rather than stored verbatim: the metadata sits right next to the
+ * image in the bucket, so the raw spec there would leak the content of
+ * the work. The hash is still enough to confirm "these two images came
+ * from the same spec".
  */
 export function specHash(prompt: string): string {
   return createHash("sha256").update(prompt, "utf8").digest("hex");

@@ -1,0 +1,28 @@
+{{/*
+Fail early, with a sentence that says what to do, rather than letting the
+pods crash-loop on a missing environment variable.
+This file renders nothing.
+*/}}
+{{- if not .Values.s3.endpoint }}
+{{- fail "s3.endpoint is required: the worker has nowhere to put generated images. Example: --set s3.endpoint=http://minio.minio:9000" }}
+{{- end }}
+{{- if not .Values.s3.bucket }}
+{{- fail "s3.bucket is required. Create the bucket first; the chart does not create it." }}
+{{- end }}
+{{- if not .Values.s3.publicBaseUrl }}
+{{- fail "s3.publicBaseUrl is required: it is the URL handed back to MCP clients, e.g. https://s3.example.com/my-bucket" }}
+{{- end }}
+{{- if and (not .Values.s3.existingSecret) (not .Values.s3.accessKeyId) }}
+{{- fail "Object storage credentials are missing: set s3.existingSecret, or s3.accessKeyId and s3.secretAccessKey" }}
+{{- end }}
+{{- if and (not .Values.redis.url) (not .Values.redis.deploy) }}
+{{- fail "No queue: set redis.url to your own Redis, or redis.deploy=true for a throwaway one" }}
+{{- end }}
+{{- if and .Values.redis.url .Values.redis.deploy }}
+{{- fail "redis.url and redis.deploy are both set; pick one" }}
+{{- end }}
+{{- if gt (int .Values.worker.replicaCount) 1 }}
+{{- if not .Values.worker.persistence.codexHome.existingClaim }}
+{{- fail "worker.replicaCount > 1 needs one Codex sign-in per replica. Give each replica its own claim (worker.persistence.codexHome.existingClaim) and install the chart once per replica, or keep replicaCount at 1." }}
+{{- end }}
+{{- end }}

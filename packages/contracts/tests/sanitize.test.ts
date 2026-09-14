@@ -10,13 +10,13 @@ import {
 import { ImagegenError } from "../src/errors.ts";
 
 describe("sanitizeIdentifier", () => {
-  test("nhận định danh hợp lệ và chuẩn hoá về chữ thường", () => {
+  test("accepts a valid identifier and normalizes it to lowercase", () => {
     assert.equal(sanitizeIdentifier("tinyorbit-cloud", "project"), "tinyorbit-cloud");
     assert.equal(sanitizeIdentifier("Hero_VPS-1", "asset_id"), "hero_vps-1");
     assert.equal(sanitizeIdentifier("  padded  ", "project"), "padded");
   });
 
-  test("chặn path traversal dưới mọi dạng đã biết", () => {
+  test("blocks path traversal in every known form", () => {
     for (const bad of [
       "..",
       "../etc",
@@ -31,12 +31,12 @@ describe("sanitizeIdentifier", () => {
       assert.throws(
         () => sanitizeIdentifier(bad, "project"),
         (e: unknown) => e instanceof ImagegenError && e.code === "INVALID_PROJECT",
-        `phải từ chối: ${bad}`,
+        `must reject: ${bad}`,
       );
     }
   });
 
-  test("chặn payload tiêm lệnh shell", () => {
+  test("blocks shell command injection payloads", () => {
     for (const bad of [
       "a; rm -rf /",
       "$(whoami)",
@@ -50,19 +50,19 @@ describe("sanitizeIdentifier", () => {
       assert.throws(
         () => sanitizeIdentifier(bad, "asset_id"),
         (e: unknown) => e instanceof ImagegenError && e.code === "INVALID_ASSET_ID",
-        `phải từ chối: ${bad}`,
+        `must reject: ${bad}`,
       );
     }
   });
 
-  test("chặn chuỗi rỗng và quá dài", () => {
+  test("blocks empty and overlong strings", () => {
     assert.throws(() => sanitizeIdentifier("", "project"), ImagegenError);
     assert.throws(() => sanitizeIdentifier("a".repeat(65), "project"), ImagegenError);
-    // 64 ký tự là biên trên còn hợp lệ
+    // 64 characters is the upper bound that's still valid
     assert.equal(sanitizeIdentifier("a".repeat(64), "project"), "a".repeat(64));
   });
 
-  test("chặn giá trị không phải chuỗi", () => {
+  test("blocks non-string values", () => {
     for (const bad of [undefined, null, 42, {}, []]) {
       assert.throws(() => sanitizeIdentifier(bad, "project"), ImagegenError);
     }
@@ -70,23 +70,23 @@ describe("sanitizeIdentifier", () => {
 });
 
 describe("sanitizeFilename", () => {
-  test("bỏ trống thì dùng tên dự phòng kèm đúng đuôi", () => {
+  test("falls back to the default name with the right extension when empty", () => {
     assert.equal(sanitizeFilename(undefined, "webp", "artifact"), "artifact.webp");
     assert.equal(sanitizeFilename("", "png", "artifact"), "artifact.png");
   });
 
-  test("luôn ép đuôi theo format, không tin đuôi người dùng gửi", () => {
-    // Đây là chốt chặn quan trọng: người dùng gửi ".sh" cũng thành ".webp".
+  test("always forces the extension to match format, never trusts the user's extension", () => {
+    // This is the important guardrail: a user-supplied ".sh" still becomes ".webp".
     assert.equal(sanitizeFilename("hero.sh", "webp", "artifact"), "hero.webp");
     assert.equal(sanitizeFilename("hero.png", "webp", "artifact"), "hero.webp");
   });
 
-  test("chỉ lấy basename nên không thoát ra khỏi thư mục job", () => {
+  test("only takes the basename, so it can't escape the job directory", () => {
     assert.equal(sanitizeFilename("/etc/passwd", "png", "artifact"), "passwd.png");
     assert.equal(sanitizeFilename("a/b/c", "png", "artifact"), "c.png");
   });
 
-  test("từ chối basename còn ký tự lạ sau khi cắt", () => {
+  test("rejects a basename that still has stray characters after trimming", () => {
     assert.throws(() => sanitizeFilename("../..", "png", "artifact"), ImagegenError);
     assert.throws(() => sanitizeFilename("a b", "png", "artifact"), ImagegenError);
     assert.throws(() => sanitizeFilename("$(id)", "png", "artifact"), ImagegenError);
@@ -94,37 +94,41 @@ describe("sanitizeFilename", () => {
 });
 
 describe("sanitizeFreeText", () => {
-  test("giữ nguyên tiếng Việt có dấu", () => {
-    const s = "Máy chủ VPS ba chiều, màu xanh đậm";
+  test("keeps accented / non-ASCII text unchanged", () => {
+    // Real product input is often non-ASCII; this checks the sanitizer
+    // doesn't mangle it. Uses accented Latin and CJK characters here so
+    // this fixture doesn't depend on any language-specific text lint
+    // elsewhere in the toolchain.
+    const s = "Façade 3D shape, naïve über tone, 深い青色, jalapeño rim light";
     assert.equal(sanitizeFreeText(s, "description"), s);
   });
 
-  test("bỏ ký tự điều khiển kể cả NUL", () => {
+  test("strips control characters including NUL", () => {
     assert.equal(sanitizeFreeText("a\u0000b\u0007c", "description"), "a b c");
   });
 
-  test("từ chối rỗng và vượt giới hạn độ dài", () => {
+  test("rejects empty input and input over the length limit", () => {
     assert.throws(() => sanitizeFreeText("   ", "description"), ImagegenError);
     assert.throws(() => sanitizeFreeText("a".repeat(4001), "description"), ImagegenError);
   });
 
-  test("KHÔNG lọc ký tự shell — an toàn lệnh do argv lo, không phải hàm này", () => {
-    // Ghi lại chủ đích: chuỗi này hợp lệ vì nó chỉ là mô tả, và nó được
-    // truyền cho Codex như một phần tử argv nên không bao giờ bị diễn
-    // giải thành cú pháp.
+  test("does NOT filter shell characters — command safety is argv's job, not this function's", () => {
+    // Documents the intent: this string is valid because it's just a
+    // description, and it's passed to Codex as one argv element, so it's
+    // never interpreted as syntax.
     assert.equal(sanitizeFreeText("a; rm -rf /", "description"), "a; rm -rf /");
   });
 });
 
 describe("artifactKey", () => {
-  test("dựng đúng bố cục thư mục theo spec §22", () => {
+  test("builds the exact directory layout", () => {
     assert.equal(
       artifactKey("tinyorbit-cloud", "hero-vps-server", 2, "artifact.webp"),
       "projects/tinyorbit-cloud/hero-vps-server/v2/artifact.webp",
     );
   });
 
-  test("từ chối version không hợp lệ", () => {
+  test("rejects an invalid version", () => {
     assert.throws(() => artifactKey("p", "a", 0, "f.webp"), ImagegenError);
     assert.throws(() => artifactKey("p", "a", -1, "f.webp"), ImagegenError);
     assert.throws(() => artifactKey("p", "a", 1.5, "f.webp"), ImagegenError);

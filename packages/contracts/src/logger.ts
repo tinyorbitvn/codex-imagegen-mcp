@@ -1,13 +1,13 @@
-// Log JSON có cấu trúc (spec §22).
+// Structured JSON logging.
 //
-// *** DANH SÁCH CẤM TUYỆT ĐỐI TRONG LOG ***
-//   access/refresh token ChatGPT, token Keycloak, client secret,
-//   key S3, header Authorization đầy đủ.
+// *** ABSOLUTELY FORBIDDEN IN LOGS ***
+//   ChatGPT access/refresh tokens, SSO/identity-provider tokens, client
+//   secrets, S3 keys, full Authorization headers.
 //
-// Cách thực thi KHÔNG phải "nhớ đừng log": mọi giá trị đi qua `redact()`
-// trước khi serialize, và các khoá nghi ngờ bị thay bằng "[redacted]"
-// theo TÊN KHOÁ. Lập trình viên sau có lỡ nhét cả object cấu hình vào
-// log thì secret vẫn không ra ngoài.
+// Enforcement is NOT "remember not to log it": every value passes through
+// `redact()` before serialization, and suspicious keys are replaced with
+// "[redacted]" BY KEY NAME. If a future developer accidentally stuffs a
+// whole config object into a log call, the secret still doesn't get out.
 
 const SECRET_KEY_PATTERN =
   /(secret|token|password|passwd|credential|authorization|api[_-]?key|access[_-]?key|private)/i;
@@ -30,19 +30,20 @@ export function redact(value: unknown, depth = 0): unknown {
 }
 
 /**
- * Tên service gắn vào mọi dòng log.
+ * Service name attached to every log line.
  *
- * KHÔNG hardcode: gói này dùng chung cho imagegen-mcp và
- * codex-image-worker, và một tên cố định sẽ khiến log của hai pod trộn
- * vào nhau không phân biệt được — đúng lúc đang cần lần một job đi qua
- * cả hai.
+ * NOT hardcoded: this package is shared by imagegen-mcp and
+ * codex-image-worker, and a fixed name would mix the two pods' logs
+ * together indistinguishably — right when you need to trace a job across
+ * both of them.
  *
- * Lấy từ OTEL_SERVICE_NAME để trùng với tên hiện trong trace, nhờ vậy
- * nhảy giữa log và trace trong Grafana không phải dịch tên.
+ * Taken from OTEL_SERVICE_NAME so it matches the name already shown in
+ * traces, so jumping between logs and traces in Grafana doesn't require
+ * translating names.
  */
 let serviceName = process.env.OTEL_SERVICE_NAME || "tinyorbit-mcp";
 
-/** Đặt tên service lúc khởi động, trước khi ghi dòng log đầu tiên. */
+/** Sets the service name at startup, before the first log line is written. */
 export function setServiceName(name: string): void {
   serviceName = name;
 }
@@ -57,7 +58,7 @@ function emit(level: Level, message: string, fields: Record<string, unknown> = {
     message,
     ...(redact(fields) as Record<string, unknown>),
   });
-  // stderr cho warn/error để tách khỏi luồng chính khi gom log.
+  // stderr for warn/error to separate them from the main stream when logs are aggregated.
   if (level === "error" || level === "warn") process.stderr.write(line + "\n");
   else process.stdout.write(line + "\n");
 }

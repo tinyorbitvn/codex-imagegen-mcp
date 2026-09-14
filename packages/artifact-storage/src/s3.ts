@@ -1,4 +1,4 @@
-// Đẩy artifact lên object storage tương thích S3 (ở cụm này là Ceph RGW).
+// Uploads artifacts to S3-compatible object storage.
 
 import {
   S3Client,
@@ -17,12 +17,12 @@ export interface UploadResult {
   durationMs: number;
 }
 
-/** Cấu hình object storage. Gói tự khai để không phụ thuộc Config của service nào. */
+/** Object storage config. This package declares its own so it doesn't depend on any service's Config. */
 export interface StorageConfig {
   endpoint: string;
   bucket: string;
   region: string;
-  /** BẮT BUỘC true với Ceph RGW sau Gateway không có listener wildcard. */
+  /** MUST be true for self-hosted S3-compatible gateways with no wildcard DNS listener for their bucket subdomain. */
   forcePathStyle: boolean;
   publicBaseUrl: string;
   signedUrlTtlSeconds: number;
@@ -39,11 +39,12 @@ export class ArtifactStorage {
     this.#client = new S3Client({
       endpoint: cfg.endpoint,
       region: cfg.region,
-      // *** BẮT BUỘC ở cụm này ***
-      // s3.tinyorbit.vn không có listener wildcard *.s3.tinyorbit.vn nên
-      // virtual-hosted-style (https://<bucket>.s3.../key) KHÔNG phân
-      // giải được. Bỏ cờ này thì lỗi hiện ra dưới dạng ENOTFOUND/timeout
-      // chứ không phải lỗi S3, rất mất thời gian lần.
+      // *** REQUIRED for self-hosted S3-compatible endpoints ***
+      // Self-hosted gateways usually have no wildcard DNS listener for their
+      // bucket subdomain, so virtual-hosted-style (https://<bucket>.s3.../key)
+      // CANNOT resolve. Drop this flag and the failure shows up as
+      // ENOTFOUND/timeout instead of an S3 error — very time-consuming to
+      // trace back.
       forcePathStyle: cfg.forcePathStyle,
       credentials: {
         accessKeyId: cfg.accessKeyId,
@@ -52,7 +53,7 @@ export class ArtifactStorage {
     });
   }
 
-  /** Kiểm với tới được storage chưa — dùng cho readiness probe. */
+  /** Checks whether storage is reachable — used for the readiness probe. */
   async isReachable(): Promise<boolean> {
     try {
       await this.#client.send(new HeadBucketCommand({ Bucket: this.#cfg.bucket }));
@@ -74,7 +75,7 @@ export class ArtifactStorage {
     } catch {
       throw new ImagegenError(
         "IMAGE_GENERATION_FAILED",
-        "Codex chạy xong nhưng không tạo ra file ảnh ở đường dẫn đã yêu cầu",
+        "Codex finished running but did not produce an image file at the requested path",
       );
     }
 
@@ -88,9 +89,9 @@ export class ArtifactStorage {
         }),
       );
     } catch {
-      // Nuốt thông điệp gốc: lỗi SDK hay kèm endpoint đầy đủ và đôi khi
-      // cả access key id trong phần ký.
-      throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Không đẩy được artifact lên object storage");
+      // Swallow the original message: SDK errors often carry the full
+      // endpoint and sometimes even the access key id in the signature part.
+      throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Failed to upload artifact to object storage");
     }
 
     return {
@@ -112,11 +113,11 @@ export class ArtifactStorage {
         }),
       );
     } catch {
-      throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Không đẩy được metadata lên object storage");
+      throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Failed to upload metadata to object storage");
     }
   }
 
-  /** Tải artifact về thư mục job — dùng cho edit_image. */
+  /** Downloads an artifact into the job directory — used by edit_image. */
   async download(key: string): Promise<Buffer> {
     try {
       const r = await this.#client.send(
@@ -126,25 +127,25 @@ export class ArtifactStorage {
       for await (const c of r.Body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(c));
       return Buffer.concat(chunks);
     } catch {
-      throw new ImagegenError("JOB_NOT_FOUND", "Không đọc được artifact nguồn từ object storage");
+      throw new ImagegenError("JOB_NOT_FOUND", "Failed to read source artifact from object storage");
     }
   }
 
   /**
-   * URL công khai trả cho Claude.
+   * Public URL returned to Claude.
    *
-   * Bucket policy cho phép GetObject ẨN DANH dưới prefix projects/* (xem
-   * templates/objectbucketclaim.yaml), nên URL trần là đủ và KHÔNG hết
-   * hạn — quan trọng vì Claude có thể xem lại ảnh ở phiên sau.
+   * The bucket policy allows ANONYMOUS GetObject under the projects/* prefix,
+   * so a bare URL is enough and it NEVER expires — important because Claude
+   * may look at the image again in a later session.
    *
-   * Muốn đổi sang URL ký sẵn thì dùng signedUrl() bên dưới và siết bucket
-   * policy lại; đánh đổi là link chết khi xoay key.
+   * To switch to a signed URL, use signedUrl() below and tighten the bucket
+   * policy; the trade-off is a dead link whenever the key rotates.
    */
   publicUrl(key: string): string {
     return `${this.#cfg.publicBaseUrl}/${key}`;
   }
 
-  /** URL ký sẵn, hạn theo S3_SIGNED_URL_TTL_SECONDS. */
+  /** Signed URL, expiring according to S3_SIGNED_URL_TTL_SECONDS. */
   async signedUrl(key: string): Promise<string> {
     return getSignedUrl(
       this.#client,

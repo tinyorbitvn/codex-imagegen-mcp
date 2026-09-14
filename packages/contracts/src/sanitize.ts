@@ -1,24 +1,23 @@
-// Làm sạch mọi chuỗi do người dùng cung cấp TRƯỚC khi nó chạm tới hệ
-// thống file hoặc dòng lệnh.
+// Sanitizes every user-supplied string BEFORE it touches the filesystem or
+// a command line.
 //
-// Nguyên tắc: DANH SÁCH CHO PHÉP, không phải danh sách cấm. Cấm "../"
-// rồi lọc dần là cuộc đua không bao giờ thắng (`....//`, `%2e%2e%2f`,
-// ký tự unicode trông giống dấu chấm...). Ở đây chỉ chấp nhận đúng một
-// tập ký tự và từ chối phần còn lại.
+// Principle: an ALLOW LIST, not a deny list. Banning "../" and patching
+// holes one by one is a race you never win (`....//`, `%2e%2e%2f`, unicode
+// characters that look like a dot...). Here only one exact character set
+// is accepted and everything else is rejected.
 
 import { ImagegenError } from "./errors.ts";
 
 /**
- * Định danh an toàn cho `project` và `asset_id`.
+ * Safe identifier for `project` and `asset_id`.
  *
- * Cho phép: chữ thường a-z, số, gạch ngang, gạch dưới.
- * Phải bắt đầu và kết thúc bằng chữ hoặc số.
- * Dài 1..64 ký tự.
+ * Allowed: lowercase a-z, digits, hyphen, underscore.
+ * Must start and end with a letter or digit.
+ * Length 1..64 characters.
  *
- * Hệ quả: KHÔNG có dấu chấm, KHÔNG có dấu gạch chéo, KHÔNG có null byte,
- * KHÔNG có khoảng trắng. Nghĩa là không tồn tại chuỗi hợp lệ nào thoát
- * ra khỏi thư mục cha, và không tồn tại chuỗi hợp lệ nào được shell diễn
- * giải thành cú pháp.
+ * Consequence: NO dots, NO slashes, NO null bytes, NO whitespace. That
+ * means there is no valid string that can escape the parent directory, and
+ * no valid string that a shell could interpret as syntax.
  */
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
 
@@ -29,19 +28,20 @@ export function sanitizeIdentifier(
   if (typeof value !== "string") {
     throw new ImagegenError(
       field === "project" ? "INVALID_PROJECT" : "INVALID_ASSET_ID",
-      `${field} phải là chuỗi`,
+      `${field} must be a string`,
     );
   }
 
-  // Chuẩn hoá NFKC TRƯỚC khi kiểm. Không có bước này thì ký tự dựng sẵn
-  // trông y hệt ASCII vẫn lọt qua regex ở dạng khác.
+  // Normalize to NFKC BEFORE validating. Skip this step and pre-composed
+  // characters that look exactly like ASCII would still slip through the
+  // regex in a different form.
   const normalized = value.normalize("NFKC").trim().toLowerCase();
 
   if (!SAFE_ID.test(normalized)) {
     throw new ImagegenError(
       field === "project" ? "INVALID_PROJECT" : "INVALID_ASSET_ID",
-      `${field} chỉ được chứa a-z, 0-9, "-", "_", dài 1..64, ` +
-        `bắt đầu và kết thúc bằng chữ hoặc số`,
+      `${field} may only contain a-z, 0-9, "-", "_", length 1..64, ` +
+        `and must start and end with a letter or digit`,
     );
   }
 
@@ -49,12 +49,12 @@ export function sanitizeIdentifier(
 }
 
 /**
- * Tên file đầu ra do người dùng đặt (tuỳ chọn).
+ * User-chosen output filename (optional).
  *
- * Chỉ lấy phần basename và ép qua cùng bộ lọc như định danh, rồi TỰ gắn
- * đuôi theo `format` — KHÔNG bao giờ tin đuôi file người dùng gửi lên.
- * Nhờ vậy không có đường nào tạo ra ".." hay "/etc/passwd" hay
- * "x.webp.sh".
+ * Only the basename is taken and it is forced through the same filter as
+ * an identifier, then the extension is ALWAYS appended based on `format`
+ * — the extension the user sent is NEVER trusted. This leaves no path
+ * that can produce ".." or "/etc/passwd" or "x.webp.sh".
  */
 export function sanitizeFilename(
   value: string | undefined,
@@ -76,7 +76,7 @@ export function sanitizeFilename(
   if (!SAFE_ID.test(base)) {
     throw new ImagegenError(
       "UNSUPPORTED_FORMAT",
-      "output.filename chỉ được chứa a-z, 0-9, \"-\", \"_\"",
+      "output.filename may only contain a-z, 0-9, \"-\", \"_\"",
     );
   }
 
@@ -84,21 +84,23 @@ export function sanitizeFilename(
 }
 
 /**
- * Văn bản tự do đi vào prompt Codex (description, style.prompt,
+ * Free text going into the Codex prompt (description, style.prompt,
  * instructions).
  *
- * Ở đây KHÔNG lọc theo danh sách ký tự — làm thế sẽ phá tiếng Việt có
- * dấu và mọi mô tả có ý nghĩa. Thay vào đó:
+ * This does NOT filter by character allow-list — doing so would break
+ * accented Vietnamese text and any meaningful description. Instead:
  *
- *   1. Bỏ ký tự điều khiển (kể cả NUL) — chúng không mang nghĩa trong mô
- *      tả ảnh và là nguyên liệu cho đủ loại trò chèn.
- *   2. Chặn độ dài, để một mô tả khổng lồ không thổi bay bộ nhớ hay bị
- *      dùng làm đòn bẩy nhồi prompt.
+ *   1. Strip control characters (including NUL) — they carry no meaning in
+ *      an image description and are raw material for every kind of
+ *      injection trick.
+ *   2. Cap the length, so a giant description can't blow up memory or be
+ *      used as a prompt-stuffing lever.
  *
- * AN TOÀN LỆNH KHÔNG DỰA VÀO HÀM NÀY. Prompt được truyền cho Codex như
- * MỘT PHẦN TỬ trong mảng argv (xem codex/runner.ts), không bao giờ nối
- * vào chuỗi shell. Kể cả khi chuỗi chứa "; rm -rf /" thì nó vẫn chỉ là
- * một tham số, không phải cú pháp. Hàm này là lớp phòng thủ thứ hai.
+ * COMMAND SAFETY DOES NOT DEPEND ON THIS FUNCTION. The prompt is passed to
+ * Codex as ONE ELEMENT of the argv array (see codex/runner.ts), never
+ * concatenated into a shell string. Even if the string contains
+ * "; rm -rf /", it's still just one argument, not syntax. This function is
+ * the second line of defense.
  */
 export function sanitizeFreeText(
   value: unknown,
@@ -106,24 +108,25 @@ export function sanitizeFreeText(
   maxLength = 4000,
 ): string {
   if (typeof value !== "string") {
-    throw new ImagegenError("IMAGE_GENERATION_FAILED", `${field} phải là chuỗi`);
+    throw new ImagegenError("IMAGE_GENERATION_FAILED", `${field} must be a string`);
   }
 
-  // Character class dưới đây CỐ Ý chứa ký tự điều khiển (viết dưới
-  // dạng escape để file vẫn là văn bản thuần — bản trước lỡ ghi byte
-  // thô khiến git coi file là binary).
+  // The character class below DELIBERATELY contains control characters
+  // (written as escapes so the file stays plain text — a previous version
+  // accidentally wrote raw bytes and git started treating the file as
+  // binary).
   const cleaned = value
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ")
     .trim();
 
   if (cleaned.length === 0) {
-    throw new ImagegenError("IMAGE_GENERATION_FAILED", `${field} không được rỗng`);
+    throw new ImagegenError("IMAGE_GENERATION_FAILED", `${field} must not be empty`);
   }
 
   if (cleaned.length > maxLength) {
     throw new ImagegenError(
       "IMAGE_GENERATION_FAILED",
-      `${field} dài quá ${maxLength} ký tự`,
+      `${field} is longer than ${maxLength} characters`,
     );
   }
 
@@ -131,10 +134,10 @@ export function sanitizeFreeText(
 }
 
 /**
- * Khoá S3 của một artifact. Ghép TỪ các mảnh đã làm sạch, không bao giờ
- * ghép từ chuỗi thô.
+ * S3 key for an artifact. Built FROM already-sanitized pieces, never
+ * assembled from a raw string.
  *
- * Bố cục theo spec §22:
+ * Layout:
  *   projects/<project>/<artifact_id>/v<version>/<filename>
  */
 export function artifactKey(
@@ -144,7 +147,7 @@ export function artifactKey(
   filename: string,
 ): string {
   if (!Number.isInteger(version) || version < 1) {
-    throw new ImagegenError("IMAGE_GENERATION_FAILED", "version phải là số nguyên >= 1");
+    throw new ImagegenError("IMAGE_GENERATION_FAILED", "version must be an integer >= 1");
   }
   return `projects/${project}/${artifactId}/v${version}/${filename}`;
 }

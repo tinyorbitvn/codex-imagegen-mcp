@@ -1,16 +1,17 @@
-// Cài đặt JobStore + JobQueue trong bộ nhớ.
+// In-memory JobStore + JobQueue implementation.
 //
-// Hai công dụng, cả hai đều thật:
-//   1. Test hợp đồng MCP và vòng đời job mà không cần dựng Redis
-//      (spec §29 Phase 2 nói thẳng là nên làm vậy trước khi đụng Codex).
-//   2. Chạy thử cục bộ một service.
+// Two uses, both real:
+//   1. Testing the MCP contract and job lifecycle without standing up
+//      Redis — useful early on, before wiring up Codex.
+//   2. Running a service locally for a quick try.
 //
-// TUYỆT ĐỐI KHÔNG dùng cho production: dữ liệu mất khi tiến trình chết,
-// và không chia sẻ được giữa các replica — vi phạm thẳng spec §30 về
-// tính bền của metadata artifact. Chart không bao giờ chọn cài đặt này.
+// NEVER use this in production: data is lost when the process dies, and it
+// can't be shared across replicas, so artifact metadata isn't durable
+// across restarts. The chart never selects this implementation.
 //
-// Sự tồn tại của file này cũng là bằng chứng lớp trừu tượng ở types.ts
-// là thật chứ không phải trang trí: có đúng hai cài đặt độc lập.
+// This file's existence is also proof that the abstraction layer in
+// types.ts is real and not decorative: there are exactly two independent
+// implementations.
 
 import { ImagegenError } from "@tinyorbit/contracts";
 import type { ArtifactRef, JobPayload, JobRecord } from "@tinyorbit/contracts";
@@ -46,7 +47,8 @@ export class InMemoryJobStore implements JobStore {
 
   async markFailed(jobId: string, code: string, message: string): Promise<void> {
     const j = this.#jobs.get(jobId);
-    // Job đã ở trạng thái cuối thì KHÔNG ghi đè — giống hệt bản Redis.
+    // A job already in a terminal state is NEVER overwritten — same rule
+    // as the Redis implementation.
     if (!j || j.status === "completed" || j.status === "cancelled") return;
     j.status = "failed";
     j.completedAt = new Date().toISOString();
@@ -116,7 +118,7 @@ export class InMemoryJobQueue implements JobQueue {
     if (this.#pending.length >= this.#limit) {
       throw new ImagegenError(
         "RATE_LIMITED",
-        `Hàng đợi đã đầy (${this.#limit} việc đang chờ). Thử lại sau.`,
+        `Queue is full (${this.#limit} jobs pending). Try again later.`,
       );
     }
     this.#pending.push(payload);

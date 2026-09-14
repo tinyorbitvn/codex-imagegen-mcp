@@ -1,8 +1,9 @@
-// Test tích hợp của consumer: Codex GIẢ + object storage GIẢ.
+// Integration test for the consumer: a FAKE Codex + fake object storage.
 //
-// Codex giả ghi ra đúng file mà chỉ dẫn yêu cầu, nên test đi qua cả
-// đường thật (thư mục job riêng, upload, metadata, dọn dẹp) mà không cần
-// tài khoản ChatGPT và không tốn quota.
+// The fake Codex writes out exactly the file the instructions ask for, so
+// the test exercises the real path (dedicated job directory, upload,
+// metadata, cleanup) without needing a ChatGPT account and without
+// spending any quota.
 
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -30,7 +31,7 @@ function spec(over: Partial<ImageSpec> = {}): ImageSpec {
   return {
     projectId: "tinyorbit-cloud",
     assetId: "homepage-hero-vps",
-    description: "máy chủ VPS",
+    description: "VPS server",
     stylePrompt: "claymorphism",
     styleReference: "tinyorbit-cloud-v1",
     aspectRatio: "1:1",
@@ -62,7 +63,7 @@ class FakeStorage {
   async uploadArtifact(localPath: string, key: string, _mime: string) {
     if (this.failUploads) {
       const { ImagegenError } = await import("@tinyorbit/contracts");
-      throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Không đẩy được artifact");
+      throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Failed to upload artifact");
     }
     let body: Buffer;
     try {
@@ -71,7 +72,7 @@ class FakeStorage {
       const { ImagegenError } = await import("@tinyorbit/contracts");
       throw new ImagegenError(
         "IMAGE_GENERATION_FAILED",
-        "Codex chạy xong nhưng không tạo ra file ảnh",
+        "Codex finished but produced no image file",
       );
     }
     this.objects.set(key, body);
@@ -82,7 +83,7 @@ class FakeStorage {
   }
   async download(key: string) {
     const b = this.objects.get(key);
-    if (!b) throw new Error("không có");
+    if (!b) throw new Error("not found");
     return b;
   }
   async isReachable() {
@@ -96,12 +97,12 @@ class FakeStorage {
   }
 }
 
-/** Codex giả thành công: ghi ra đúng file mà chỉ dẫn yêu cầu. */
+/** Fake Codex that succeeds: writes out exactly the file the instructions ask for. */
 const codexOk: CodexRunner = async (opts) => {
   const m = /Save the (?:final generated asset|edited artifact) to exactly this path: (.+)$/m.exec(
     opts.prompt,
   );
-  assert.ok(m, "chỉ dẫn phải nêu đường dẫn đầu ra");
+  assert.ok(m, "the instructions must state the output path");
   await writeFile(m![1]!.trim(), Buffer.from("PNGFAKE"));
   return { exitCode: 0, durationMs: 5, stderrTail: "" };
 };
@@ -129,7 +130,7 @@ function build(runner: CodexRunner, storage = new FakeStorage()) {
   return { consumer, store, queue, storage };
 }
 
-/** Chạy consumer đủ lâu để xử lý xong job rồi dừng. */
+/** Runs the consumer long enough to process one job, then stops it. */
 async function runOnce(c: Consumer, store: InMemoryJobStore, jobId: string): Promise<string> {
   void c.run();
   const deadline = Date.now() + 5000;
@@ -142,7 +143,7 @@ async function runOnce(c: Consumer, store: InMemoryJobStore, jobId: string): Pro
     }
     if (Date.now() > deadline) {
       c.stop();
-      throw new Error(`job không kết thúc, đang ${s}`);
+      throw new Error(`job never finished, still ${s}`);
     }
     await new Promise((r) => setTimeout(r, 10));
   }
@@ -152,8 +153,8 @@ function payload(jobId: string, s: ImageSpec): JobPayload {
   return { jobId, kind: "create", spec: s, version: 1, parentVersion: null, sourceKey: null, instructions: null };
 }
 
-describe("consumer — đường thành công", () => {
-  test("artifact nằm đúng khoá S3 theo spec §19", async () => {
+describe("consumer — happy path", () => {
+  test("artifact lands at the correct S3 key layout", async () => {
     const { consumer, store, queue, storage } = build(codexOk);
     const s = spec();
     await store.create(record("img_1", s));
@@ -172,21 +173,21 @@ describe("consumer — đường thành công", () => {
     assert.equal(job!.artifact!.width, 1536);
   });
 
-  test("metadata ghi style_reference nhưng KHÔNG ghi đặc tả nguyên văn", async () => {
+  test("metadata records style_reference but does NOT record the raw spec", async () => {
     const { consumer, store, queue, storage } = build(codexOk);
-    const s = spec({ description: "bí mật thương mại không được lộ" });
+    const s = spec({ description: "confidential trade secret, must not leak" });
     await store.create(record("img_2", s));
     await queue.enqueue(payload("img_2", s));
     await runOnce(consumer, store, "img_2");
 
     const meta = JSON.stringify([...storage.metadata.values()]);
-    assert.doesNotMatch(meta, /bí mật thương mại/);
+    assert.doesNotMatch(meta, /confidential trade secret/);
     assert.match(meta, /"spec_hash":\s*"[0-9a-f]{64}"/);
     assert.match(meta, /"style_reference":\s*"tinyorbit-cloud-v1"/);
     assert.match(meta, /"generator":\s*"codex-chatgpt-image"/);
   });
 
-  test("dọn sạch thư mục job sau khi xong", async () => {
+  test("cleans up the job directory once done", async () => {
     const { consumer, store, queue } = build(codexOk);
     const s = spec();
     await store.create(record("img_3", s));
@@ -194,12 +195,12 @@ describe("consumer — đường thành công", () => {
     await runOnce(consumer, store, "img_3");
 
     const left = await readdir(join(workRoot, "jobs")).catch(() => []);
-    assert.ok(!left.includes("img_3"), "thư mục job phải bị xoá");
+    assert.ok(!left.includes("img_3"), "the job directory must be removed");
   });
 });
 
-describe("consumer — Codex thất bại", () => {
-  test("phiên hết hạn -> CODEX_NOT_AUTHENTICATED, KHÔNG rò stderr ra ngoài", async () => {
+describe("consumer — Codex fails", () => {
+  test("expired session -> CODEX_NOT_AUTHENTICATED, does NOT leak stderr externally", async () => {
     const { consumer, store, queue } = build(
       codexFailing("Error: not logged in; see /home/codex/.codex/auth.json"),
     );
@@ -210,13 +211,13 @@ describe("consumer — Codex thất bại", () => {
     assert.equal(await runOnce(consumer, store, "img_4"), "failed");
     const job = await store.get("img_4");
     assert.equal(job!.errorCode, "CODEX_NOT_AUTHENTICATED");
-    // stderr chứa đường dẫn file token — không được đi ra ngoài (spec §22).
+    // stderr contains the token file's path — must never be exposed externally.
     assert.doesNotMatch(JSON.stringify(job), /auth\.json/);
   });
 
-  test("tài khoản không có khả năng sinh ảnh -> lỗi KHẢ NĂNG tường minh", async () => {
-    // Spec §31: phải báo lỗi khả năng rõ ràng, và nói thẳng là không có
-    // đường vòng qua API key.
+  test("account lacks the image-generation capability -> explicit CAPABILITY error", async () => {
+    // Must report an explicit capability error, and state plainly there
+    // is no fallback through an API key.
     const { consumer, store, queue } = build(
       codexFailing("image generation is not available on your plan"),
     );
@@ -227,10 +228,10 @@ describe("consumer — Codex thất bại", () => {
     assert.equal(await runOnce(consumer, store, "img_5"), "failed");
     const job = await store.get("img_5");
     assert.equal(job!.errorCode, "IMAGE_CAPABILITY_UNAVAILABLE");
-    assert.match(job!.errorMessage!, /KHÔNG tự chuyển sang OpenAI API key/);
+    assert.match(job!.errorMessage!, /does NOT automatically fall back to an OpenAI API key/);
   });
 
-  test("Codex báo thành công nhưng không tạo file -> vẫn failed", async () => {
+  test("Codex reports success but produces no file -> still failed", async () => {
     const noFile: CodexRunner = async () => ({ exitCode: 0, durationMs: 5, stderrTail: "" });
     const { consumer, store, queue } = build(noFile);
     const s = spec();
@@ -240,8 +241,8 @@ describe("consumer — Codex thất bại", () => {
   });
 });
 
-describe("consumer — upload thất bại", () => {
-  test("job thành failed với STORAGE_UPLOAD_FAILED", async () => {
+describe("consumer — upload fails", () => {
+  test("job ends up failed with STORAGE_UPLOAD_FAILED", async () => {
     const storage = new FakeStorage();
     storage.failUploads = true;
     const { consumer, store, queue } = build(codexOk, storage);
@@ -254,10 +255,10 @@ describe("consumer — upload thất bại", () => {
   });
 });
 
-describe("consumer — huỷ job", () => {
-  test("job bị huỷ khi còn trong hàng đợi thì KHÔNG chạy Codex", async () => {
-    // Quan trọng: mỗi lần chạy Codex là quota thật. Huỷ trước khi chạy
-    // phải thật sự tiết kiệm được lượt đó.
+describe("consumer — cancelling a job", () => {
+  test("a job cancelled while still queued does NOT run Codex", async () => {
+    // Important: every Codex run is real quota. Cancelling before it runs
+    // must actually save that unit.
     let codexCalls = 0;
     const counting: CodexRunner = async (opts) => {
       codexCalls += 1;
@@ -270,52 +271,53 @@ describe("consumer — huỷ job", () => {
     await queue.requestCancel("img_8");
 
     assert.equal(await runOnce(consumer, store, "img_8"), "cancelled");
-    assert.equal(codexCalls, 0, "Codex không được chạy cho job đã huỷ");
+    assert.equal(codexCalls, 0, "Codex must not run for a cancelled job");
   });
 });
 
-describe("consumer — cứu ảnh Codex sinh ra nhưng đặt sai chỗ", () => {
-  // Codex sinh ảnh vào $CODEX_HOME/generated_images/<phiên>/ rồi mới
-  // chuyển sang chỗ ta yêu cầu. Bước tự kiểm sau đó gọi `python`, mà
-  // image không có python, nên nó bỏ dở việc chuyển file NHƯNG VẪN
-  // THOÁT 0. Đo trong pod thật 2026-09-12: 9 PNG mồ côi, dấu thời gian
-  // khớp đúng các job hỏng. Mỗi tấm là một lượt quota ChatGPT đã trả.
+describe("consumer — salvaging an image Codex generated but misplaced", () => {
+  // Codex generates the image into $CODEX_HOME/generated_images/<session>/
+  // and only then moves it to the path we requested. Its self-check step
+  // used to call `python`, and the image had no python, so it abandoned
+  // the move step BUT STILL EXITED 0. Measured in a real pod on
+  // 2026-09-12: 9 orphaned PNGs, timestamps lining up exactly with the
+  // failed jobs. Each one is a unit of paid ChatGPT quota.
 
-  /** Codex giả "đãng trí": sinh ảnh vào kho riêng, quên chuyển đi. */
-  function codexQuenChuyen(body: string): CodexRunner {
+  /** "Forgetful" fake Codex: generates the image into its own store, forgets to move it. */
+  function codexForgetful(body: string): CodexRunner {
     return async (opts) => {
-      const dir = join(opts.codexHome, "generated_images", "phien-abc");
+      const dir = join(opts.codexHome, "generated_images", "session-abc");
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, "img-001.png"), Buffer.from(body));
       return { exitCode: 0, durationMs: 5, stderrTail: "" };
     };
   }
 
-  test("lấy ảnh trong generated_images thay vì vứt một lượt quota", async () => {
-    const { consumer, store, queue, storage } = build(codexQuenChuyen("ANH-CUU-DUOC"));
+  test("picks up the image from generated_images instead of wasting a unit of quota", async () => {
+    const { consumer, store, queue, storage } = build(codexForgetful("SALVAGED-IMAGE"));
     const s = spec();
     await store.create(record("img_salvage_1", s));
     await queue.enqueue(payload("img_salvage_1", s));
 
     assert.equal(await runOnce(consumer, store, "img_salvage_1"), "completed");
     const key = [...storage.objects.keys()].find((k) => k.endsWith("artifact.png"));
-    assert.ok(key, "phải có artifact được đẩy lên");
-    assert.equal(storage.objects.get(key!)!.toString(), "ANH-CUU-DUOC");
+    assert.ok(key, "the artifact must have been uploaded");
+    assert.equal(storage.objects.get(key!)!.toString(), "SALVAGED-IMAGE");
   });
 
-  test("KHÔNG lấy ảnh cũ hơn lúc job bắt đầu — giao nhầm còn tệ hơn báo hỏng", async () => {
+  test("does NOT pick up an image older than when the job started — a wrong delivery is worse than reporting failure", async () => {
     const { consumer, store, queue } = build(async () => ({
       exitCode: 0,
       durationMs: 5,
       stderrTail: "",
     }));
-    // Ảnh của một job TRƯỚC, nằm sẵn trong kho từ một giờ trước.
-    const dir = join(workRoot, "codex", "generated_images", "phien-cu");
+    // Image from a PREVIOUS job, already sitting in the store from an hour ago.
+    const dir = join(workRoot, "codex", "generated_images", "old-session");
     await mkdir(dir, { recursive: true });
-    const cu = join(dir, "img-cu.png");
-    await writeFile(cu, Buffer.from("ANH-CUA-JOB-TRUOC"));
-    const motGioTruoc = new Date(Date.now() - 3_600_000);
-    await utimes(cu, motGioTruoc, motGioTruoc);
+    const oldFile = join(dir, "img-old.png");
+    await writeFile(oldFile, Buffer.from("IMAGE-FROM-PREVIOUS-JOB"));
+    const oneHourAgo = new Date(Date.now() - 3_600_000);
+    await utimes(oldFile, oneHourAgo, oneHourAgo);
 
     const s = spec();
     await store.create(record("img_salvage_2", s));
@@ -325,8 +327,8 @@ describe("consumer — cứu ảnh Codex sinh ra nhưng đặt sai chỗ", () =>
     assert.equal((await store.get("img_salvage_2"))!.errorCode, "IMAGE_GENERATION_FAILED");
   });
 
-  test("không có kho generated_images thì báo hỏng gọn, không nổ lỗi khác", async () => {
-    const rieng = await mkdtemp(join(tmpdir(), "codex-worker-trong-"));
+  test("no generated_images store present -> reports a clean failure, no unrelated crash", async () => {
+    const isolatedRoot = await mkdtemp(join(tmpdir(), "codex-worker-empty-"));
     try {
       const store = new InMemoryJobStore();
       const queue = new InMemoryJobQueue();
@@ -336,8 +338,8 @@ describe("consumer — cứu ảnh Codex sinh ra nhưng đặt sai chỗ", () =>
         queue,
         storage: storage as unknown as ArtifactStorage,
         config: {
-          workDir: join(rieng, "jobs"),
-          codexHome: join(rieng, "codex-trong"),
+          workDir: join(isolatedRoot, "jobs"),
+          codexHome: join(isolatedRoot, "codex-empty"),
           codexBinary: "codex",
           jobTimeoutSeconds: 30,
           concurrency: 1,
@@ -351,25 +353,26 @@ describe("consumer — cứu ảnh Codex sinh ra nhưng đặt sai chỗ", () =>
       assert.equal(await runOnce(consumer, store, "img_salvage_3"), "failed");
       assert.equal((await store.get("img_salvage_3"))!.errorCode, "IMAGE_GENERATION_FAILED");
     } finally {
-      await rm(rieng, { recursive: true, force: true });
+      await rm(isolatedRoot, { recursive: true, force: true });
     }
   });
 });
 
-describe("consumer — metadata phải ĐO ảnh, không chép lại yêu cầu", () => {
-  // Đo trên job thật 2026-09-12: xin 1536x1536, Codex trả 1254x1254,
-  // mà metadata vẫn khai 1536x1536 vì code ghi thẳng `spec.width`.
-  // Claude đọc metadata đó rồi dựng bố cục sai mà không ai biết.
+describe("consumer — metadata must MEASURE the image, not echo the request", () => {
+  // Measured on a real job 2026-09-12: asked for 1536x1536, Codex
+  // returned 1254x1254, yet the metadata still claimed 1536x1536 because
+  // the code wrote `spec.width` directly. Claude reads that metadata and
+  // builds a layout on the wrong assumption, with no one the wiser.
 
-  /** PNG hợp lệ tối thiểu, kích thước và colorType tuỳ chọn. */
+  /** A minimal real PNG, with a chosen size and colorType. */
   function pngThat(w: number, h: number, colorType: number): Buffer {
-    const kenh = colorType === 6 ? 4 : 3;
+    const channels = colorType === 6 ? 4 : 3;
     const ihdr = Buffer.alloc(13);
     ihdr.writeUInt32BE(w, 0);
     ihdr.writeUInt32BE(h, 4);
     ihdr[8] = 8;
     ihdr[9] = colorType;
-    const idat = deflateSync(Buffer.alloc(h * (1 + w * kenh)));
+    const idat = deflateSync(Buffer.alloc(h * (1 + w * channels)));
     const chunk = (t: string, d: Buffer) => {
       const len = Buffer.alloc(4);
       len.writeUInt32BE(d.length, 0);
@@ -383,7 +386,7 @@ describe("consumer — metadata phải ĐO ảnh, không chép lại yêu cầu"
     ]);
   }
 
-  function codexTraVe(buf: Buffer): CodexRunner {
+  function codexReturning(buf: Buffer): CodexRunner {
     return async (opts) => {
       const m = /Save the (?:final generated asset|edited artifact) to exactly this path: (.+)$/m.exec(
         opts.prompt,
@@ -393,27 +396,28 @@ describe("consumer — metadata phải ĐO ảnh, không chép lại yêu cầu"
     };
   }
 
-  test("khai kích thước THẬT của ảnh chứ không phải kích thước đã xin", async () => {
-    const { consumer, store, queue, storage } = build(codexTraVe(pngThat(1254, 1254, 6)));
+  test("records the image's REAL dimensions, not the requested ones", async () => {
+    const { consumer, store, queue, storage } = build(codexReturning(pngThat(1254, 1254, 6)));
     const s = spec({ width: 1536, height: 1536 });
     await store.create(record("img_meta_1", s));
     await queue.enqueue(payload("img_meta_1", s));
 
     assert.equal(await runOnce(consumer, store, "img_meta_1"), "completed");
     const art = (await store.get("img_meta_1"))!.artifact!;
-    assert.equal(art.width, 1254, "phải là số đo từ file");
+    assert.equal(art.width, 1254, "must be the measurement from the file");
     assert.equal(art.height, 1254);
 
     const meta = [...storage.metadata.values()][0] as Record<string, unknown>;
-    assert.equal(meta.width, 1254, "metadata.json cũng phải theo file");
+    assert.equal(meta.width, 1254, "metadata.json must also follow the file");
     assert.equal(meta.height, 1254);
   });
 
-  test("ảnh không có kênh alpha thì transparent=false, dù đã xin nền trong suốt", async () => {
-    // Xin một đằng nhận một nẻo là chuyện có thật; metadata phải nói
-    // đúng thứ nằm trong file, nếu không Claude sẽ ghép ảnh có nền đặc
-    // lên bố cục tưởng là trong suốt.
-    const { consumer, store, queue } = build(codexTraVe(pngThat(64, 64, 2)));
+  test("an image with no alpha channel yields transparent=false, even if a transparent background was requested", async () => {
+    // Asking for one thing and getting another is a real occurrence;
+    // metadata must state what's actually in the file, otherwise Claude
+    // will composite an opaque image onto a layout that assumes it's
+    // transparent.
+    const { consumer, store, queue } = build(codexReturning(pngThat(64, 64, 2)));
     const s = spec({ transparentBackground: true });
     await store.create(record("img_meta_2", s));
     await queue.enqueue(payload("img_meta_2", s));
@@ -422,8 +426,8 @@ describe("consumer — metadata phải ĐO ảnh, không chép lại yêu cầu"
     assert.equal((await store.get("img_meta_2"))!.artifact!.transparent, false);
   });
 
-  test("không đọc được header thì lùi về đặc tả, KHÔNG làm hỏng job", async () => {
-    const { consumer, store, queue } = build(codexTraVe(Buffer.from("khong phai anh")));
+  test("falls back to the spec when the header can't be read, does NOT fail the job", async () => {
+    const { consumer, store, queue } = build(codexReturning(Buffer.from("not an image")));
     const s = spec({ width: 1536, height: 1536 });
     await store.create(record("img_meta_3", s));
     await queue.enqueue(payload("img_meta_3", s));
@@ -434,37 +438,38 @@ describe("consumer — metadata phải ĐO ảnh, không chép lại yêu cầu"
   });
 });
 
-describe("pruneGeneratedImages — không để kho ảnh của Codex phình vô hạn", () => {
-  // Codex để lại một bản ảnh SAU MỌI job, kể cả job thành công. Đo
-  // 2026-09-12: 9 file / 5.9MB sau một buổi thử, ~0.7MB mỗi lượt.
+describe("pruneGeneratedImages — keeps Codex's image store from growing without bound", () => {
+  // Codex leaves an image behind AFTER EVERY job, including successful
+  // ones. Measured 2026-09-12: 9 files / 5.9MB after one afternoon of
+  // testing, ~0.7MB per run.
 
-  async function dungKho(): Promise<string> {
+  async function seedImageStore(): Promise<string> {
     const home = await mkdtemp(join(tmpdir(), "codexhome-"));
-    await mkdir(join(home, "generated_images", "phien-cu"), { recursive: true });
-    await mkdir(join(home, "generated_images", "phien-moi"), { recursive: true });
-    const cu = join(home, "generated_images", "phien-cu", "cu.png");
-    const moi = join(home, "generated_images", "phien-moi", "moi.png");
-    await writeFile(cu, Buffer.from("CU"));
-    await writeFile(moi, Buffer.from("MOI"));
-    const batNgay = new Date(Date.now() - 48 * 3_600_000);
-    await utimes(cu, batNgay, batNgay);
+    await mkdir(join(home, "generated_images", "old-session"), { recursive: true });
+    await mkdir(join(home, "generated_images", "new-session"), { recursive: true });
+    const oldFile = join(home, "generated_images", "old-session", "old.png");
+    const newFile = join(home, "generated_images", "new-session", "new.png");
+    await writeFile(oldFile, Buffer.from("OLD"));
+    await writeFile(newFile, Buffer.from("NEW"));
+    const twoDaysAgo = new Date(Date.now() - 48 * 3_600_000);
+    await utimes(oldFile, twoDaysAgo, twoDaysAgo);
     return home;
   }
 
-  test("xoá ảnh quá hạn và bỏ luôn thư mục phiên đã rỗng", async () => {
-    const home = await dungKho();
+  test("removes expired images and drops the now-empty session directory too", async () => {
+    const home = await seedImageStore();
     try {
       const n = await pruneGeneratedImages(home, 24 * 3_600_000);
       assert.equal(n, 1);
-      const conLai = await readdir(join(home, "generated_images"));
-      assert.deepEqual(conLai, ["phien-moi"], "thư mục rỗng phải bị dọn theo");
+      const remaining = await readdir(join(home, "generated_images"));
+      assert.deepEqual(remaining, ["new-session"], "the empty directory must be cleaned up too");
     } finally {
       await rm(home, { recursive: true, force: true });
     }
   });
 
-  test("KHÔNG đụng vào ảnh còn trong hạn — salvage vẫn cần đọc chúng", async () => {
-    const home = await dungKho();
+  test("does NOT touch images still within the retention window — salvage still needs to read them", async () => {
+    const home = await seedImageStore();
     try {
       const n = await pruneGeneratedImages(home, 72 * 3_600_000);
       assert.equal(n, 0);
@@ -474,8 +479,8 @@ describe("pruneGeneratedImages — không để kho ảnh của Codex phình vô
     }
   });
 
-  test("maxAge = 0 nghĩa là TẮT hẳn, không xoá gì", async () => {
-    const home = await dungKho();
+  test("maxAge = 0 means COMPLETELY OFF, deletes nothing", async () => {
+    const home = await seedImageStore();
     try {
       assert.equal(await pruneGeneratedImages(home, 0), 0);
       assert.equal((await readdir(join(home, "generated_images"))).length, 2);
@@ -484,7 +489,7 @@ describe("pruneGeneratedImages — không để kho ảnh của Codex phình vô
     }
   });
 
-  test("kho không tồn tại thì trả 0, không ném lỗi", async () => {
-    assert.equal(await pruneGeneratedImages(join(tmpdir(), "khong-co-that-xyz"), 1000), 0);
+  test("a nonexistent store returns 0, doesn't throw", async () => {
+    assert.equal(await pruneGeneratedImages(join(tmpdir(), "does-not-exist-xyz"), 1000), 0);
   });
 });

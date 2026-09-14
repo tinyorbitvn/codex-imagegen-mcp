@@ -1,11 +1,13 @@
-# Sinh ra lúc build/test, không commit.
+# Produced by build/test runs; never committed.
 node_modules/
 dist/
 *.tsbuildinfo
 
-# Không bao giờ commit: repo này công khai.
+# Never commit: this repository is public.
 .env
 .env.*
+# ...except the sample, which the quick start tells people to copy.
+!.env.example
 *.pem
 *.key
 *.b64

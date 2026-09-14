@@ -9,7 +9,7 @@ import { artifactKey } from "../src/consumer.ts";
 const spec: ImageSpec = {
   projectId: "tinyorbit-cloud",
   assetId: "homepage-hero-vps",
-  description: "Máy chủ VPS ba chiều",
+  description: "Three-dimensional VPS server",
   stylePrompt: "3D illustration\nclaymorphism",
   styleReference: "tinyorbit-cloud-v1",
   aspectRatio: "1:1",
@@ -23,62 +23,65 @@ const spec: ImageSpec = {
 };
 
 describe("buildCodexArgv", () => {
-  test("prompt luôn là MỘT phần tử argv duy nhất", () => {
-    // Bài test quan trọng nhất của cả bộ: chừng nào prompt còn là một
-    // phần tử, không cú pháp shell nào trong đó có hiệu lực.
-    const nasty = 'vẽ logo"; rm -rf / #\n$(whoami)\n`id`';
+  test("the prompt is always exactly ONE argv element", () => {
+    // The most important test in the whole suite: as long as the prompt
+    // stays a single element, no shell syntax inside it has any effect.
+    const nasty = 'draw a logo"; rm -rf / #\n$(whoami)\n`id`';
     const argv = buildCodexArgv("codex", nasty);
     assert.equal(argv.at(-1), nasty);
     assert.equal(argv.filter((a) => a === nasty).length, 1);
   });
 
-  test("không sinh ra phần tử nào chứa cú pháp shell", () => {
+  test("never produces an element containing shell syntax", () => {
     const argv = buildCodexArgv("codex", "x");
     assert.ok(!argv.some((a) => a === "-c" || a === "sh" || a === "bash"));
   });
 
-  test("tắt sandbox nội bộ của Codex (bwrap không chạy được trong pod)", () => {
-    // Sandbox thật là chính container (drop ALL, non-root, rootfs chỉ
-    // đọc). bwrap của Codex cần user namespace không đặc quyền nên chết
-    // trong pod, và Codex khi đó thoát mã 0 mà KHÔNG ghi file — hỏng câm.
-    // Xem lý do đầy đủ ở buildCodexArgv.
+  test("disables Codex's own internal sandbox (bwrap can't run in the pod)", () => {
+    // The real sandbox is the container itself (drop ALL, non-root,
+    // read-only rootfs). Codex's bwrap needs an unprivileged user
+    // namespace, so it dies in the pod, and Codex then exits code 0
+    // WITHOUT writing a file — a silent failure. See the full explanation
+    // on buildCodexArgv.
     const argv = buildCodexArgv("codex", "x");
     const i = argv.indexOf("--sandbox");
-    assert.ok(i > 0, "phải truyền --sandbox");
+    assert.ok(i > 0, "must pass --sandbox");
     assert.equal(argv[i + 1], "danger-full-access");
-    // Giá trị sandbox KHÔNG được là phần tử cuối — prompt mới là cuối.
+    // The sandbox value must NOT be the last element — the prompt is last.
     assert.notEqual(i + 1, argv.length - 1);
   });
 
-  test("xuống dòng trong prompt không tách thành tham số mới", () => {
-    // Khẳng định BẤT BIẾN, không ghim con số: prompt nhiều dòng phải cho
-    // ra đúng số phần tử như prompt một dòng, và vẫn nằm gọn ở phần tử
-    // cuối. Ghim `length === 4` như bản cũ làm test đỏ mỗi lần thêm một
-    // cờ hợp lệ (đã đỏ thật khi thêm --sandbox), che mất điều đang muốn
-    // kiểm là "xuống dòng không tách tham số".
-    const nhieuDong = "dòng 1\ndòng 2\ndòng 3";
-    const argv = buildCodexArgv("codex", nhieuDong);
-    const motDong = buildCodexArgv("codex", "x");
-    assert.equal(argv.length, motDong.length);
-    assert.equal(argv.at(-1), nhieuDong);
+  test("a newline in the prompt does not split into a new argument", () => {
+    // Assert an INVARIANT, don't pin a magic number: a multi-line prompt
+    // must produce the same element count as a one-line prompt, and still
+    // land entirely in the last element. Pinning `length === 4` like the
+    // old version did makes this test fail every time a new valid flag is
+    // added (it really did fail when --sandbox was added), which hides
+    // the thing actually being tested: "a newline doesn't split into a
+    // new argument".
+    const multiLine = "line 1\nline 2\nline 3";
+    const argv = buildCodexArgv("codex", multiLine);
+    const oneLine = buildCodexArgv("codex", "x");
+    assert.equal(argv.length, oneLine.length);
+    assert.equal(argv.at(-1), multiLine);
   });
 });
 
 describe("buildCodexEnv", () => {
-  test("KHÔNG chuyển OPENAI_API_KEY xuống tiến trình con", () => {
-    // Chốt chặn spec §15/§31: kể cả pod có biến này, Codex cũng không
-    // thấy, nên không có đường nào âm thầm tính tiền qua API key.
+  test("does NOT forward OPENAI_API_KEY to the child process", () => {
+    // Even if the pod has this variable, Codex never sees it, so there's
+    // no path for it to silently start billing through an API key.
     const env = buildCodexEnv("/home/codex/.codex", {
-      OPENAI_API_KEY: "sk-không-được-phép",
+      OPENAI_API_KEY: "sk-not-allowed",
       PATH: "/usr/bin",
     });
     assert.equal(env.OPENAI_API_KEY, undefined);
   });
 
-  test("KHÔNG chuyển key S3, mật khẩu Redis hay biến nội bộ nào khác", () => {
+  test("does NOT forward the S3 key, the Redis password, or any other internal variable", () => {
     const env = buildCodexEnv("/home/codex/.codex", {
       AWS_ACCESS_KEY_ID: "AKIA",
-      AWS_SECRET_ACCESS_KEY: "bí mật",
+      AWS_SECRET_ACCESS_KEY: "secret",
       REDIS_URL: "redis://:pw@redis:6379",
       S3_ENDPOINT: "http://rgw",
       PATH: "/usr/bin",
@@ -89,7 +92,7 @@ describe("buildCodexEnv", () => {
     assert.equal(env.S3_ENDPOINT, undefined);
   });
 
-  test("chỉ có đúng các khoá trong danh sách cho phép", () => {
+  test("only the keys on the allowlist are present", () => {
     const env = buildCodexEnv("/home/codex/.codex", { PATH: "/usr/bin", RANDOM_VAR: "x" });
     assert.deepEqual(Object.keys(env).sort(), [
       "CODEX_HOME", "HOME", "LANG", "PATH", "TERM", "TMPDIR",
@@ -98,7 +101,7 @@ describe("buildCodexEnv", () => {
 });
 
 describe("classifyCodexFailure", () => {
-  test("nhận ra phiên đăng nhập hết hạn", () => {
+  test("recognizes an expired login session", () => {
     for (const s of [
       "Error: not logged in",
       "please run codex login first",
@@ -109,9 +112,9 @@ describe("classifyCodexFailure", () => {
     }
   });
 
-  test("nhận ra tài khoản KHÔNG có khả năng sinh ảnh", () => {
-    // Spec §31: phải phân biệt được với "chưa đăng nhập", vì hai tình
-    // huống này cần hai hành động khắc phục khác hẳn nhau.
+  test("recognizes an account that does NOT have the image-generation capability", () => {
+    // Must be distinguishable from "not logged in", since the two
+    // situations call for two completely different fixes.
     for (const s of [
       "image generation is not available on your plan",
       "unsupported capability: images",
@@ -122,14 +125,14 @@ describe("classifyCodexFailure", () => {
     }
   });
 
-  test("không đoán được thì rơi về lỗi chung, KHÔNG đoán bừa", () => {
+  test("falls back to a generic error when it can't tell, does NOT guess wildly", () => {
     assert.equal(classifyCodexFailure("segfault at 0x0"), "IMAGE_GENERATION_FAILED");
     assert.equal(classifyCodexFailure(""), "IMAGE_GENERATION_FAILED");
   });
 });
 
 describe("buildCreatePrompt", () => {
-  test("đường dẫn đầu ra do worker cấp, xuất hiện tường minh", () => {
+  test("the output path is supplied by the worker and appears explicitly", () => {
     const p = buildCreatePrompt(spec, "/work/jobs/img_abc");
     assert.match(
       p,
@@ -137,19 +140,20 @@ describe("buildCreatePrompt", () => {
     );
   });
 
-  test("khoá phạm vi Codex lại, không cho làm việc khác", () => {
+  test("locks Codex's scope down, doesn't let it do anything else", () => {
     const p = buildCreatePrompt(spec, "/work/jobs/img_abc");
     assert.match(p, /Do not write any other file\./);
     assert.match(p, /Apart from that, do not read or modify anything outside that directory\./);
-    // Ngoại lệ BẮT BUỘC phải có: thiếu nó thì Codex từ chối chép chính
-    // tấm ảnh nó vừa sinh, rồi thoát 0 — hỏng câm, mất một lượt quota.
+    // The exception is MANDATORY: without it, Codex refuses to copy back
+    // the very image it just generated, then exits 0 — a silent failure
+    // that burns a unit of quota.
     assert.match(p, /You may read the image-generation tool's own output directory/);
     assert.match(p, /Do not perform unrelated tasks\./);
   });
 
-  test("isolated_object sinh ra yêu cầu tách vật thể — điều kiện để làm animation", () => {
-    // Spec §21: nhiều vật chuyển động độc lập thì mỗi vật phải là một
-    // artifact riêng trên nền trong suốt.
+  test("isolated_object produces a request to isolate the subject — a precondition for animation", () => {
+    // When several objects need to move independently, each one must be
+    // its own artifact on a transparent background.
     const p = buildCreatePrompt(spec, "/d");
     assert.match(p, /isolated object: render ONLY the requested subject/);
     assert.match(p, /no neighboring objects/);
@@ -158,7 +162,7 @@ describe("buildCreatePrompt", () => {
     assert.doesNotMatch(flat, /isolated object: render ONLY/);
   });
 
-  test("nền trong suốt sinh ra yêu cầu alpha, nền đục thì không", () => {
+  test("a transparent background produces an alpha requirement, an opaque one doesn't", () => {
     assert.match(buildCreatePrompt(spec, "/d"), /transparent background \(alpha channel\)/);
     assert.match(
       buildCreatePrompt({ ...spec, transparentBackground: false }, "/d"),
@@ -166,14 +170,15 @@ describe("buildCreatePrompt", () => {
     );
   });
 
-  test("nhúng style profile đã phân giải, không phải tên profile", () => {
+  test("embeds the already-resolved style profile, not its name", () => {
     const p = buildCreatePrompt(spec, "/d");
     assert.match(p, /Style:\n3D illustration\nclaymorphism/);
-    // Tên profile KHÔNG đi vào prompt — Codex cần nội dung, không cần mã.
+    // The profile's NAME does not go into the prompt — Codex needs the
+    // content, not the identifier.
     assert.doesNotMatch(p, /tinyorbit-cloud-v1/);
   });
 
-  test("nhúng kích thước và safe padding đã cho", () => {
+  test("embeds the given dimensions and safe padding", () => {
     const p = buildCreatePrompt(spec, "/d");
     assert.match(p, /1536 x 1536/);
     assert.match(p, /at least 12% safe padding/);
@@ -181,8 +186,8 @@ describe("buildCreatePrompt", () => {
 });
 
 describe("buildEditPrompt", () => {
-  test("cấm ghi đè ảnh nguồn", () => {
-    const p = buildEditPrompt(spec, "thu nhỏ máy chủ", "source.png", "/work/jobs/img_def");
+  test("forbids overwriting the source image", () => {
+    const p = buildEditPrompt(spec, "shrink the server", "source.png", "/work/jobs/img_def");
     assert.match(p, /Do not overwrite the source image\./);
     assert.match(p, /Source image file: \/work\/jobs\/img_def\/source\.png/);
     assert.match(
@@ -193,7 +198,7 @@ describe("buildEditPrompt", () => {
 });
 
 describe("artifactKey", () => {
-  test("dựng đúng bố cục thư mục theo spec §19", () => {
+  test("builds the correct directory layout", () => {
     assert.equal(
       artifactKey("tinyorbit-cloud", "homepage-hero-vps", 2, "artifact.png"),
       "projects/tinyorbit-cloud/homepage-hero-vps/v2/artifact.png",
@@ -202,7 +207,7 @@ describe("artifactKey", () => {
 });
 
 describe("specHash", () => {
-  test("ổn định và khác nhau theo nội dung", () => {
+  test("stable, and differs based on content", () => {
     assert.equal(specHash("a"), specHash("a"));
     assert.notEqual(specHash("a"), specHash("b"));
     assert.match(specHash("a"), /^[0-9a-f]{64}$/);

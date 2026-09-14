@@ -1,15 +1,15 @@
-// Mô hình job dùng CHUNG giữa imagegen-mcp và codex-image-worker.
+// Job model SHARED between imagegen-mcp and codex-image-worker.
 //
-// Đây là lý do gói `contracts` tồn tại: hai service chạy ở hai pod khác
-// nhau nhưng phải hiểu y hệt nhau về hình dạng một job. Định nghĩa hai
-// lần là sớm muộn cũng lệch — và lệch sẽ hiện ra dưới dạng job im lặng
-// hỏng, không phải lỗi biên dịch.
+// This is the reason the `contracts` package exists: the two services run
+// in two different pods but must agree exactly on the shape of a job.
+// Defining it twice would drift sooner or later — and the drift would show
+// up as a job silently breaking, not as a compile error.
 
 import type { AspectRatio, OutputFormat } from "./schemas.ts";
 
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
-/** Trạng thái cuối — job đã ở đây thì không bao giờ đổi nữa. */
+/** Terminal states — once a job is here, it never changes again. */
 export const TERMINAL_STATUSES: readonly JobStatus[] = [
   "completed",
   "failed",
@@ -21,20 +21,20 @@ export function isTerminal(s: JobStatus): boolean {
 }
 
 /**
- * Đặc tả ảnh đã CHUẨN HOÁ.
+ * NORMALIZED image spec.
  *
- * imagegen-mcp nhận đầu vào thô từ MCP, làm sạch và điền mặc định rồi
- * mới tạo ra cấu trúc này. Worker KHÔNG bao giờ thấy chuỗi thô của
- * người dùng ngoài ba trường văn bản đã lọc bên dưới — nhờ vậy phần
- * dựng lệnh Codex chỉ phải tin một nguồn duy nhất.
+ * imagegen-mcp takes raw MCP input, sanitizes it and fills in defaults, and
+ * only then builds this structure. The worker NEVER sees a raw user string
+ * except the three filtered text fields below — which means the part that
+ * builds the Codex command only has to trust one source.
  */
 export interface ImageSpec {
   projectId: string;
   assetId: string;
   description: string;
-  /** Đã gộp: style profile (nếu có) + prompt thêm của người gọi. */
+  /** Already merged: style profile (if any) + the caller's extra prompt. */
   stylePrompt: string;
-  /** Tên style profile đã dùng, để ghi vào metadata. */
+  /** Name of the style profile used, to record in metadata. */
   styleReference: string | null;
   aspectRatio: AspectRatio;
   width: number;
@@ -43,21 +43,21 @@ export interface ImageSpec {
   outputFormat: OutputFormat;
   isolatedObject: boolean;
   safePaddingPercent: number;
-  /** Tên file đầu ra trong thư mục job. Do worker đặt, không phải người dùng. */
+  /** Output filename inside the job directory. Set by the worker, not the user. */
   filename: string;
 }
 
-/** Việc mà worker phải làm. */
+/** The work the worker has to do. */
 export interface JobPayload {
   jobId: string;
   kind: "create" | "edit";
   spec: ImageSpec;
   version: number;
-  /** Chỉ có với kind="edit". */
+  /** Only present when kind="edit". */
   parentVersion: number | null;
-  /** Khoá S3 của ảnh nguồn, chỉ có với kind="edit". */
+  /** S3 key of the source image, only present when kind="edit". */
   sourceKey: string | null;
-  /** Chỉ có với kind="edit": chỉ dẫn sửa, đã lọc. */
+  /** Only present when kind="edit": sanitized edit instructions. */
   instructions: string | null;
 }
 
@@ -83,7 +83,7 @@ export interface JobRecord {
   assetId: string;
   version: number;
   parentVersion: number | null;
-  /** Chủ thể gọi, lấy từ claim JWT mà agentgateway chuyển xuống. */
+  /** Calling principal, taken from the JWT claim forwarded by agentgateway. */
   principal: string;
   createdAt: string;
   startedAt: string | null;
@@ -91,7 +91,7 @@ export interface JobRecord {
   artifact: ArtifactRef | null;
   errorCode: string | null;
   errorMessage: string | null;
-  /** trace_id của OpenTelemetry, để nối log job với trace gateway. */
+  /** OpenTelemetry trace_id, to link job logs with the gateway trace. */
   traceId: string | null;
 }
 
@@ -100,7 +100,7 @@ export const MIME_BY_FORMAT: Record<OutputFormat, string> = {
   webp: "image/webp",
 };
 
-/** Hình dạng trả về cho MCP client (spec §11, §12). */
+/** Shape returned to the MCP client. */
 export function jobToResult(job: JobRecord): Record<string, unknown> {
   const out: Record<string, unknown> = {
     job_id: job.jobId,

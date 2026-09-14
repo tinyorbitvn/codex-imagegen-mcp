@@ -1,11 +1,12 @@
-// Hợp đồng mà MỌI cài đặt JobStore/JobQueue phải giữ.
+// The contract every JobStore/JobQueue implementation MUST uphold.
 //
-// Chạy trên bản in-memory vì nó không cần Redis. Bản Redis
-// (RedisJobStore/RedisJobQueue) PHẢI hành xử y hệt — các bất biến dưới
-// đây được cài song song ở cả hai file, và đây là chỗ ghi lại chúng.
+// Runs against the in-memory implementation because it doesn't need Redis.
+// The Redis implementation (RedisJobStore/RedisJobQueue) MUST behave
+// IDENTICALLY — the invariants below are implemented in parallel in both
+// files, and this is where they're written down.
 //
-// Muốn chạy cùng bộ này với Redis thật thì dựng một Redis rồi thay
-// factory ở đầu file; mọi assert giữ nguyên.
+// To run this same suite against real Redis, stand up a Redis instance and
+// swap the factory at the top of the file; every assertion stays the same.
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -46,7 +47,7 @@ function payload(jobId: string): JobPayload {
   };
 }
 
-describe("JobStore — bất biến trạng thái", () => {
+describe("JobStore — state invariants", () => {
   test("queued -> running -> completed", async () => {
     const s = new InMemoryJobStore();
     await s.create(record());
@@ -58,17 +59,17 @@ describe("JobStore — bất biến trạng thái", () => {
     assert.equal(done.artifact!.version, 1);
   });
 
-  test("job đã completed KHÔNG bị markFailed ghi đè", async () => {
-    // Bảo vệ artifact đã phát hành: một lượt dọn dẹp muộn không được
-    // biến job thành công thành thất bại.
+  test("a completed job is NOT overwritten by markFailed", async () => {
+    // Protects a published artifact: a late cleanup pass must not turn a
+    // successful job into a failed one.
     const s = new InMemoryJobStore();
     await s.create(record());
     await s.markCompleted("img_1", artifact());
-    await s.markFailed("img_1", "IMAGE_GENERATION_FAILED", "muộn");
+    await s.markFailed("img_1", "IMAGE_GENERATION_FAILED", "late");
     assert.equal((await s.get("img_1"))!.status, "completed");
   });
 
-  test("chỉ huỷ được job đang chờ hoặc đang chạy", async () => {
+  test("only a queued or running job can be cancelled", async () => {
     const s = new InMemoryJobStore();
     await s.create(record({ jobId: "img_q" }));
     assert.equal(await s.markCancelled("img_q"), true);
@@ -80,24 +81,24 @@ describe("JobStore — bất biến trạng thái", () => {
   });
 });
 
-describe("JobStore — cấp phát phiên bản", () => {
-  test("đếm theo mốc ĐÃ CẤP, không phải mốc đã hoàn tất", async () => {
-    // Nếu cấp theo bản hoàn tất thì hai job song song cùng nhận v1 và
-    // job sau ghi đè job trước trên object storage.
+describe("JobStore — version allocation", () => {
+  test("counts by the ALLOCATED marker, not the completed one", async () => {
+    // Allocating by completed version would let two parallel jobs both get
+    // v1, and the later one overwrites the earlier one in object storage.
     const s = new InMemoryJobStore();
     await s.create(record({ jobId: "img_1", version: 1 }));
     assert.equal(await s.highestAllocatedVersion("p", "a"), 1);
-    assert.equal(await s.getArtifact("p", "a"), null, "chưa có bản hoàn tất nào");
+    assert.equal(await s.getArtifact("p", "a"), null, "no completed version yet");
   });
 
-  test("job thất bại trả số phiên bản lại cho lần sau", async () => {
+  test("a failed job gives its version number back for next time", async () => {
     const s = new InMemoryJobStore();
     await s.create(record({ jobId: "img_1", version: 1 }));
     await s.markFailed("img_1", "IMAGE_GENERATION_FAILED", "x");
     assert.equal(await s.highestAllocatedVersion("p", "a"), 0);
   });
 
-  test("getArtifact bỏ trống version thì lấy bản mới nhất", async () => {
+  test("getArtifact with no version returns the latest one", async () => {
     const s = new InMemoryJobStore();
     for (const v of [1, 2, 3]) {
       await s.create(record({ jobId: `img_${v}`, version: v }));
@@ -109,7 +110,7 @@ describe("JobStore — cấp phát phiên bản", () => {
   });
 });
 
-describe("JobQueue — bất biến hàng đợi", () => {
+describe("JobQueue — queue invariants", () => {
   test("FIFO", async () => {
     const q = new InMemoryJobQueue();
     await q.enqueue(payload("img_1"));
@@ -118,16 +119,16 @@ describe("JobQueue — bất biến hàng đợi", () => {
     assert.equal((await q.dequeue(500))!.jobId, "img_2");
   });
 
-  test("hàng đợi rỗng thì dequeue trả null sau timeout, KHÔNG treo", async () => {
-    // Quan trọng: vòng lặp consumer phải quay lại kiểm được cờ dừng,
-    // nếu không pod chỉ tắt khi bị SIGKILL.
+  test("an empty queue makes dequeue return null after the timeout, NOT hang", async () => {
+    // Important: the consumer loop must be able to check the stop flag
+    // again, otherwise the pod only shuts down via SIGKILL.
     const q = new InMemoryJobQueue();
     const t0 = Date.now();
     assert.equal(await q.dequeue(100), null);
     assert.ok(Date.now() - t0 >= 90);
   });
 
-  test("vượt trần thì ném RATE_LIMITED chứ không xếp hàng vô hạn", async () => {
+  test("exceeding the cap throws RATE_LIMITED instead of queueing without limit", async () => {
     const q = new InMemoryJobQueue(2);
     await q.enqueue(payload("img_1"));
     await q.enqueue(payload("img_2"));
@@ -137,17 +138,17 @@ describe("JobQueue — bất biến hàng đợi", () => {
     );
   });
 
-  test("việc chưa ack còn trong processing và reapStale nhặt lại được", async () => {
-    // Đây là thứ giữ cho job không treo ở "running" mãi khi worker chết
-    // giữa chừng (spec §30).
+  test("an un-acked job stays in processing, and reapStale picks it back up", async () => {
+    // This is what keeps a job from hanging at "running" forever when the
+    // worker dies mid-job.
     const q = new InMemoryJobQueue();
     await q.enqueue(payload("img_1"));
     await q.dequeue(500);
     assert.deepEqual((await q.reapStale()).map((p) => p.jobId), ["img_1"]);
-    assert.deepEqual(await q.reapStale(), [], "nhặt rồi thì không nhặt lại");
+    assert.deepEqual(await q.reapStale(), [], "once picked up, it's not picked up again");
   });
 
-  test("ack xong thì reapStale không thấy nữa", async () => {
+  test("once acked, reapStale no longer sees it", async () => {
     const q = new InMemoryJobQueue();
     await q.enqueue(payload("img_1"));
     await q.dequeue(500);
@@ -155,7 +156,7 @@ describe("JobQueue — bất biến hàng đợi", () => {
     assert.deepEqual(await q.reapStale(), []);
   });
 
-  test("cờ huỷ đọc lại được", async () => {
+  test("the cancellation flag can be read back", async () => {
     const q = new InMemoryJobQueue();
     assert.equal(await q.isCancelled("img_1"), false);
     await q.requestCancel("img_1");
