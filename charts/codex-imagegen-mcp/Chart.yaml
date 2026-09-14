@@ -3,9 +3,9 @@ name: codex-imagegen-mcp
 description: MCP server that generates images with the Codex CLI, using a ChatGPT subscription instead of the paid image API. One pod by default.
 type: application
 # Chart version. Bump on every chart change.
-version: 0.2.0
+version: 0.2.1
 # Version of the image this chart defaults to.
-appVersion: "0.5.0"
+appVersion: "0.5.1"
 home: https://github.com/tinyorbitvn/codex-imagegen-mcp
 sources:
   - https://github.com/tinyorbitvn/codex-imagegen-mcp

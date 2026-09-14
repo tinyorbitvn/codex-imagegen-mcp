@@ -34,11 +34,15 @@ import { startTelemetry } from "./telemetry.ts";
 
 const config = loadConfig();
 
-// One service name for every role: they are one process and one image now,
-// and splitting the name by role would split the logs and traces of a
-// single deployment into two halves that look unrelated.
-setServiceName("codex-imagegen-mcp");
-await startTelemetry("codex-imagegen-mcp", config.otlpEndpoint);
+// One image runs every role, so the name it reports is configurable rather
+// than fixed. Unset, both halves report the project name, which is what you
+// want for the single-process default: one deployment, one name. A split
+// deployment sets OTEL_SERVICE_NAME per Deployment instead, so the
+// endpoint's logs and traces stay distinguishable from the worker's exactly
+// when you are following one job across both.
+const serviceName = process.env.OTEL_SERVICE_NAME || "codex-imagegen-mcp";
+setServiceName(serviceName);
+await startTelemetry(serviceName, config.otlpEndpoint);
 
 // --- Queue and store -------------------------------------------------
 let store: JobStore;
