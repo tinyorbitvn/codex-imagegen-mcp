@@ -70,6 +70,24 @@ accepting work nobody will collect. In a single pod, check `ROLE` really is
 call gave up waiting, not that the job did; `get_image_job(job_id)` keeps
 following it.
 
+## Jobs fail with `CODEX_QUOTA_EXHAUSTED`
+
+The ChatGPT account behind the worker has spent its usage limit. The job
+error carries the reason and, when Codex gives one, the time it says to
+retry — Codex prints that hour with no timezone, so treat it as the
+account's own clock rather than yours.
+
+Nothing in the request caused it and nothing in the service will clear it:
+wait for the limit to reset, or add credits to the account. The worker logs
+the full Codex stderr next to the job id; only the classified code and the
+retry time ever reach the caller.
+
+Two separate limits can be spent at once, and this is the one that no
+configuration here can raise. The service's own hourly counter (below)
+counts a job when it is created, so failures like these have already used
+their slot — a spent account quota can therefore be followed by
+`RATE_LIMITED` until the hour rolls over.
+
 ## New calls are rejected while the queue is fine
 
 Two limits can do that, and they say which one it is. `QUEUE_LIMIT` caps how

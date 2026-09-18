@@ -16,7 +16,7 @@ import type { JobQueue, JobStore } from "../queue/index.ts";
 import type { ArtifactStore } from "../storage/index.ts";
 
 import { buildCreatePrompt, buildEditPrompt, specHash } from "./prompt.ts";
-import { classifyCodexFailure, runCodex } from "./runner.ts";
+import { classifyCodexFailure, retryHintFrom, runCodex } from "./runner.ts";
 import type { CodexResult } from "./runner.ts";
 import { metrics } from "./metrics.ts";
 import { readImageInfo } from "./imagesize.ts";
@@ -321,15 +321,20 @@ export class Consumer {
 
       if (result.exitCode !== 0) {
         const code = classifyCodexFailure(result.stderrTail);
+        // Only a spent quota carries a retry time, and only the
+        // sanitized form of it (see retryHintFrom) ever leaves here.
+        const retryHint =
+          code === "CODEX_QUOTA_EXHAUSTED" ? retryHintFrom(result.stderrTail) : null;
         // stderr ONLY goes to server-side logs (secrets already filtered
         // out), NEVER back over MCP.
         log.warn("codex exited with non-zero status", {
           job_id: jobId,
           codex_exit_code: result.exitCode,
           classified: code,
+          retry_hint: retryHint,
           stderr_tail: result.stderrTail,
         });
-        throw new ImagegenError(code, messageFor(code));
+        throw new ImagegenError(code, messageFor(code, retryHint));
       }
 
       // Codex exiting 0 does NOT guarantee the file landed where expected
@@ -482,8 +487,20 @@ export class Consumer {
   }
 }
 
-function messageFor(code: string): string {
+function messageFor(code: string, retryHint: string | null = null): string {
   switch (code) {
+    case "CODEX_QUOTA_EXHAUSTED":
+      // Says WHOSE limit it is: the caller has no account here and
+      // cannot buy anything, so the actionable part is "wait, or tell an
+      // operator". The retry time is attributed to Codex because Codex
+      // prints it without a timezone.
+      return (
+        "The ChatGPT account this service generates images with has spent its " +
+        "usage limit, so no image was produced. The request itself is fine and " +
+        "will work once the limit resets, or once an operator adds credits to " +
+        "the account." +
+        (retryHint ? ` Codex reported: try again ${retryHint} (no timezone given).` : "")
+      );
     case "CODEX_NOT_AUTHENTICATED":
       return (
         "The worker's ChatGPT login session has expired. " +

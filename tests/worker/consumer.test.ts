@@ -231,6 +231,30 @@ describe("consumer — Codex fails", () => {
     assert.match(job!.errorMessage!, /does NOT automatically fall back to an OpenAI API key/);
   });
 
+  test("a spent ChatGPT usage limit is reported as itself, not as a generic failure", async () => {
+    // What the caller gets back has to name the cause: the account's
+    // quota is gone, the request was fine, and here is when to retry.
+    const { consumer, store, queue } = build(
+      codexFailing(
+        "workdir: /work/jobs/img_quota\n" +
+          "ERROR: You've hit your usage limit. Upgrade to Pro, visit\n" +
+          "https://chatgpt.com/codex/settings/usage to purchase more credits\n" +
+          "or try again at 9:02 AM.",
+      ),
+    );
+    const s = spec();
+    await store.create(record("img_quota", s));
+    await queue.enqueue(payload("img_quota", s));
+
+    assert.equal(await runOnce(consumer, store, "img_quota"), "failed");
+    const job = await store.get("img_quota");
+    assert.equal(job!.errorCode, "CODEX_QUOTA_EXHAUSTED");
+    assert.match(job!.errorMessage!, /usage limit/i);
+    assert.match(job!.errorMessage!, /9:02 AM/);
+    // The retry time is the ONLY thing taken from stderr: no workdir, no URL.
+    assert.doesNotMatch(JSON.stringify(job), /workdir|chatgpt\.com/);
+  });
+
   test("Codex reports success but produces no file -> still failed", async () => {
     const noFile: CodexRunner = async () => ({ exitCode: 0, durationMs: 5, stderrTail: "" });
     const { consumer, store, queue } = build(noFile);

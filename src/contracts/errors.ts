@@ -14,6 +14,15 @@ export const ERROR_CODES = [
   // operations can tell "not logged in" apart from "logged in but the
   // plan doesn't support it".
   "IMAGE_CAPABILITY_UNAVAILABLE",
+  // The account is logged in and CAN generate images, but has spent its
+  // ChatGPT usage limit. Separate from IMAGE_GENERATION_FAILED because
+  // the answer is "wait or buy credits", not "look at the logs", and
+  // separate from RATE_LIMITED because that one is THIS service's own
+  // per-principal counter, which an operator can raise. Observed
+  // 2026-09-18: five jobs died on a spent quota and every one of them
+  // came back as the generic code, so the real reason only existed in
+  // the worker's logs.
+  "CODEX_QUOTA_EXHAUSTED",
   "IMAGE_GENERATION_FAILED",
   "JOB_NOT_FOUND",
   "JOB_CANCELLED",

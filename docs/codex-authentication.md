@@ -108,6 +108,11 @@ plan cannot generate images. Signing in again will not fix it; the account
 needs a plan that supports image generation. There is no API-key path around
 this either.
 
+`CODEX_QUOTA_EXHAUSTED` means the sign-in is valid and the account can
+generate images, but its usage limit is spent. Signing in again will not fix
+that one either: it needs time or credits. See
+[Troubleshooting](troubleshooting.md).
+
 ## Why an API key cannot leak in by accident
 
 Three independent places would each have to be changed for the worker to use

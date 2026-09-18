@@ -2,7 +2,12 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
 import type { ImageSpec } from "../../src/contracts/index.ts";
-import { buildCodexArgv, buildCodexEnv, classifyCodexFailure } from "../../src/worker/runner.ts";
+import {
+  buildCodexArgv,
+  buildCodexEnv,
+  classifyCodexFailure,
+  retryHintFrom,
+} from "../../src/worker/runner.ts";
 import { buildCreatePrompt, buildEditPrompt, specHash } from "../../src/worker/prompt.ts";
 import { artifactKey } from "../../src/worker/consumer.ts";
 
@@ -125,9 +130,73 @@ describe("classifyCodexFailure", () => {
     }
   });
 
+  test("recognizes the ChatGPT account running out of its usage limit", () => {
+    // Verbatim from a real failed job on 2026-09-18: five jobs in a row
+    // died this way and every one of them was reported as the generic
+    // IMAGE_GENERATION_FAILED, which sent the operator digging through
+    // worker logs to find a cause Codex had already stated plainly.
+    const real =
+      "ERROR: You've hit your usage limit. Upgrade to Pro, visit\n" +
+      "https://chatgpt.com/codex/settings/usage to purchase more credits\n" +
+      "or try again at 9:02 AM.";
+    for (const s of [
+      real,
+      "usage limit reached for this account",
+      "you have exceeded your quota",
+      "HTTP 429 Too Many Requests",
+    ]) {
+      assert.equal(classifyCodexFailure(s), "CODEX_QUOTA_EXHAUSTED", s);
+    }
+  });
+
+  test("a spent quota is NOT mistaken for an account that lacks the capability", () => {
+    // The real message says "Upgrade to Pro", one word away from the
+    // capability branch's "upgrade your plan". The two need different
+    // fixes: wait/buy credits vs. change account.
+    assert.equal(
+      classifyCodexFailure("You've hit your usage limit. Upgrade to Pro to continue."),
+      "CODEX_QUOTA_EXHAUSTED",
+    );
+  });
+
+  test("does not read a quota failure out of the prompt echoed back in stderr", () => {
+    // Codex prints the whole prompt before the error, so a single loose
+    // word like "quota" would classify a user's own wording as a spent
+    // account quota.
+    assert.equal(
+      classifyCodexFailure("user\nDraw a dashboard showing disk quota and rate limit gauges"),
+      "IMAGE_GENERATION_FAILED",
+    );
+  });
+
   test("falls back to a generic error when it can't tell, does NOT guess wildly", () => {
     assert.equal(classifyCodexFailure("segfault at 0x0"), "IMAGE_GENERATION_FAILED");
     assert.equal(classifyCodexFailure(""), "IMAGE_GENERATION_FAILED");
+  });
+});
+
+describe("retryHintFrom", () => {
+  test("pulls the retry time out of Codex's usage-limit message", () => {
+    assert.equal(
+      retryHintFrom("to purchase more credits or try again at 9:02 AM."),
+      "at 9:02 AM",
+    );
+  });
+
+  test("keeps a relative hint readable", () => {
+    assert.equal(retryHintFrom("Please try again in 27 minutes"), "in 27 minutes");
+  });
+
+  test("returns null when Codex offers no hint", () => {
+    assert.equal(retryHintFrom(""), null);
+    assert.equal(retryHintFrom("segfault at 0x0"), null);
+  });
+
+  test("refuses anything that is not a plain time — this text is shown to callers", () => {
+    // Whatever this returns crosses the MCP boundary, so it must never
+    // carry a path, a URL or a token fragment out of stderr.
+    assert.equal(retryHintFrom("try again at /home/codex/.codex/auth.json"), null);
+    assert.equal(retryHintFrom("try again at https://chatgpt.com/codex/settings"), null);
   });
 });
 

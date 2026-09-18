@@ -127,11 +127,12 @@ export async function isCodexAuthenticated(codexHome: string): Promise<boolean> 
 /**
  * Guesses an error code from Codex's stderr.
  *
- * When the logged-in ChatGPT account or session does NOT have the
- * image-generation capability, callers need an EXPLICIT capability error,
- * never a silent fall back to an OPENAI_API_KEY. To do that we first need
- * to tell three situations apart, and stderr is the only thing Codex
- * gives us to work with.
+ * Four situations need to be told apart, and stderr is the only thing
+ * Codex gives us to work with: not signed in, signed in but the account
+ * cannot generate images, signed in and able but out of usage limit, and
+ * everything else. The first two must be EXPLICIT rather than a silent
+ * fall back to an OPENAI_API_KEY; the third must be explicit because
+ * otherwise the only place the reason exists is the worker's own log.
  *
  * Deliberately uses loose string matching: Codex's wording changes
  * between releases, so a wrong guess falls back to
@@ -141,8 +142,35 @@ export async function isCodexAuthenticated(codexHome: string): Promise<boolean> 
  */
 export function classifyCodexFailure(
   stderr: string,
-): "CODEX_NOT_AUTHENTICATED" | "IMAGE_CAPABILITY_UNAVAILABLE" | "IMAGE_GENERATION_FAILED" {
+):
+  | "CODEX_NOT_AUTHENTICATED"
+  | "CODEX_QUOTA_EXHAUSTED"
+  | "IMAGE_CAPABILITY_UNAVAILABLE"
+  | "IMAGE_GENERATION_FAILED" {
   const s = stderr.toLowerCase();
+
+  // Checked FIRST, and with PHRASES rather than single words. Codex
+  // echoes the whole prompt into stderr before its own error, so a bare
+  // "quota" or "rate limit" would classify the caller's own description
+  // ("a dashboard of disk quota gauges") as a spent account quota.
+  //
+  // Kept apart from the capability branch below on purpose: the real
+  // message says "Upgrade to Pro", one word away from "upgrade your
+  // plan", but a spent quota needs waiting or credits, while a missing
+  // capability needs a different account.
+  if (
+    /(?:hit|reach(?:ed)?|exceed(?:ed)?|over)\b[^.\n]{0,24}\busage limit\b/.test(s) ||
+    /\busage limit\b[^.\n]{0,24}\b(?:reached|exceeded|hit)\b/.test(s) ||
+    /(?:purchase|buy) more credits/.test(s) ||
+    /(?:out of|insufficient) credits/.test(s) ||
+    /(?:exceeded|hit|reached)[^.\n]{0,16}\bquota\b/.test(s) ||
+    /\bquota (?:exceeded|exhausted)\b/.test(s) ||
+    /too many requests/.test(s) ||
+    /rate[_ ]limit(?:ed)?[_ ](?:exceeded|reached)/.test(s) ||
+    /\b(?:http|status|code)\b[^0-9\n]{0,8}429\b/.test(s)
+  ) {
+    return "CODEX_QUOTA_EXHAUSTED";
+  }
 
   if (
     s.includes("not logged in") ||
@@ -168,6 +196,28 @@ export function classifyCodexFailure(
   }
 
   return "IMAGE_GENERATION_FAILED";
+}
+
+/**
+ * Pulls "try again at 9:02 AM" out of Codex's usage-limit message.
+ *
+ * This is the ONE piece of stderr allowed across the MCP boundary, so it
+ * is an ALLOWLIST of characters, not a cleanup pass: a clock time, a
+ * short duration, maybe a timezone. Anything with a slash, a quote or no
+ * digit at all — a path, a URL, a token fragment — is dropped and the
+ * caller simply gets the message without a retry time.
+ *
+ * Codex prints the hour with NO timezone, which is why the message that
+ * carries this value says where the number came from instead of
+ * presenting it as our own.
+ */
+export function retryHintFrom(stderr: string): string | null {
+  const m = /try again (at|in) ([^.\n]{1,40})/i.exec(stderr);
+  if (!m) return null;
+  const value = m[2]!.trim();
+  if (!/^[0-9A-Za-z][0-9A-Za-z :+-]*$/.test(value)) return null;
+  if (!/\d/.test(value)) return null;
+  return `${m[1]!.toLowerCase()} ${value}`;
 }
 
 /** Whether the Codex binary is present in the image. */
