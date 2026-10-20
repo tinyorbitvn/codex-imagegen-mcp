@@ -78,7 +78,7 @@ A healthy worker answers something like:
 ```
 
 `--device-auth` is the flag to use because the container has no browser and
-cannot receive a loopback OAuth callback. It exists in Codex CLI 0.154.0,
+cannot receive a loopback OAuth callback. It exists in Codex CLI 0.163.0,
 which the image pins. On a build without it, plain `codex login` waits on a
 loopback port, and you have to forward that port to your own machine before
 opening the login URL. Codex prints the port it chose, commonly 1455.

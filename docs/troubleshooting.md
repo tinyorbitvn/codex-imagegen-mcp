@@ -35,7 +35,7 @@ ones, while the account was an active Plus subscription. Old CLI versions stop
 being served for the ChatGPT session auth flow.
 
 The fix is to use a Codex version the backend still accepts. The image pins an exact
-version in `Dockerfile` (`CODEX_VERSION`), currently 0.154.0. Pinning is deliberate: the worker builds a fixed command
+version in `Dockerfile` (`CODEX_VERSION`), currently 0.163.0. Pinning is deliberate: the worker builds a fixed command
 line, and Codex renames flags often enough that following `latest` eventually
 breaks every job at once.
 

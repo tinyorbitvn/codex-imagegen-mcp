@@ -48,7 +48,7 @@ RUN --mount=type=cache,target=/root/.npm npm prune --omit=dev
 # of a bundled `vendor/` directory, so npm installs exactly one of them and
 # there is nothing to prune.
 FROM ${BASE_REGISTRY}/node:22-bookworm-slim AS codex
-ARG CODEX_VERSION=0.154.0
+ARG CODEX_VERSION=0.163.0
 RUN npm install -g "@openai/codex@${CODEX_VERSION}" && npm cache clean --force
 
 
