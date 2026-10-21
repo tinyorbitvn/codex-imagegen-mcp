@@ -306,6 +306,13 @@ describe("rate limit", () => {
       await service.createImage({ project_id: "p", asset_id: "a4", description: "x" }, "someone-else"),
     );
   });
+
+  test("0 turns the limit off", async () => {
+    const { service } = build({ createImagePerHour: 0, editImagePerHour: 0 });
+    for (let i = 0; i < 5; i++) {
+      await service.createImage({ project_id: "p", asset_id: `a${i}`, description: "x" }, "claude");
+    }
+  });
 });
 
 describe("waitForImage — waiting and progress reporting", () => {

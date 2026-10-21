@@ -357,8 +357,12 @@ export class ImagegenService {
    * This is required because imagegen-mcp runs MULTIPLE replicas: a local
    * count would multiply the effective limit by the replica count, which
    * means it's no longer a limit at all.
+   *
+   * A limit of 0 turns the check off. The ChatGPT plan's own usage limit
+   * still applies and surfaces as CODEX_QUOTA_EXHAUSTED.
    */
   async #checkRate(principal: string, limit: number, windowMs: number): Promise<void> {
+    if (limit === 0) return;
     const used = await this.#store.countSince(principal, Date.now() - windowMs);
     if (used >= limit) {
       throw new ImagegenError(

@@ -50,7 +50,7 @@ queueLimit: 64
 # Per-caller hourly limits. The caller comes from the
 # x-agentgateway-principal, x-jwt-sub or x-user header, in that order, and
 # falls back to "anonymous" — so behind an unauthenticated ingress every
-# caller shares one bucket.
+# caller shares one bucket. 0 turns a limit off.
 rateLimit:
   createImagePerHour: 10
   editImagePerHour: 20

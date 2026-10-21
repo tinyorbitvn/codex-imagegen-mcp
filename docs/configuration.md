@@ -59,8 +59,8 @@ the key, a plain unsigned GET, so that bucket has to allow anonymous download.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RATE_LIMIT_CREATE_IMAGE_PER_HOUR` | `10` | Per caller. |
-| `RATE_LIMIT_EDIT_IMAGE_PER_HOUR` | `20` | Per caller. |
+| `RATE_LIMIT_CREATE_IMAGE_PER_HOUR` | `10` | Per caller. `0` turns the limit off. |
+| `RATE_LIMIT_EDIT_IMAGE_PER_HOUR` | `20` | Per caller. `0` turns the limit off. |
 
 The caller identity is taken from the first header present out of
 `x-agentgateway-principal`, `x-jwt-sub`, `x-user`, and is `anonymous`
