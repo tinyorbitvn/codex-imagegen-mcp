@@ -11,6 +11,12 @@
 // twice and left to drift.
 
 import { z } from "zod";
+import {
+  ANIMATION_INTENSITIES,
+  ANIMATION_MOTIONS,
+  MAX_ANIMATION_DURATION_MS,
+  MIN_ANIMATION_DURATION_MS,
+} from "./animation.ts";
 
 export const ASPECT_RATIOS = ["1:1", "3:2", "2:3", "16:9", "9:16"] as const;
 export type AspectRatio = (typeof ASPECT_RATIOS)[number];
@@ -117,7 +123,7 @@ export const createImageSchema = {
 };
 
 export const getImageJobSchema = {
-  job_id: z.string().describe("job_id returned by create_image or edit_image."),
+  job_id: z.string().describe("job_id returned by create_image, edit_image or animate_image."),
 };
 
 export const editImageSchema = {
@@ -155,6 +161,38 @@ export const editImageSchema = {
     ),
 };
 
+export const animateImageSchema = {
+  project_id: z.string(),
+  asset_id: z.string(),
+  source_version: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe("Still image to animate. Omit for the latest version."),
+  motion: z
+    .enum(ANIMATION_MOTIONS)
+    .describe(
+      "spin: one full turn. pulse: grow and shrink. shake: a damped wobble, " +
+        "like a ringing bell. bounce: a hop with a squash on landing. " +
+        "float: drift up and down.",
+    ),
+  duration_ms: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      `One loop in milliseconds. Defaults per motion; clamped to ` +
+        `${MIN_ANIMATION_DURATION_MS}-${MAX_ANIMATION_DURATION_MS}.`,
+    ),
+  intensity: z
+    .enum(ANIMATION_INTENSITIES)
+    .optional()
+    .describe("How far the object moves. Defaults to medium."),
+  wait: editImageSchema.wait,
+  timeout_seconds: editImageSchema.timeout_seconds,
+};
+
 export const getArtifactSchema = {
   project_id: z.string(),
   asset_id: z.string(),
@@ -165,10 +203,11 @@ export const cancelImageJobSchema = {
   job_id: z.string(),
 };
 
-/** Names of the 5 tools Claude Design gets to see. */
+/** Names of the 6 tools Claude Design gets to see. */
 export const PUBLIC_TOOLS = [
   "create_image",
   "edit_image",
+  "animate_image",
   "get_image_job",
   "get_artifact",
   "cancel_image_job",

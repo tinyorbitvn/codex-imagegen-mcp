@@ -5,6 +5,7 @@
 // Defining it twice would drift sooner or later — and the drift would show
 // up as a job silently breaking, not as a compile error.
 
+import type { AnimationInfo, AnimationRequest } from "./animation.ts";
 import type { AspectRatio, OutputFormat } from "./schemas.ts";
 
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -50,15 +51,17 @@ export interface ImageSpec {
 /** The work the worker has to do. */
 export interface JobPayload {
   jobId: string;
-  kind: "create" | "edit";
+  kind: "create" | "edit" | "animate";
   spec: ImageSpec;
   version: number;
-  /** Only present when kind="edit". */
+  /** Present when kind is "edit" or "animate". */
   parentVersion: number | null;
-  /** S3 key of the source image, only present when kind="edit". */
+  /** S3 key of the source image, present when kind is "edit" or "animate". */
   sourceKey: string | null;
   /** Only present when kind="edit": sanitized edit instructions. */
   instructions: string | null;
+  /** Only present when kind="animate". */
+  animation?: AnimationRequest;
 }
 
 export interface ArtifactRef {
@@ -74,6 +77,11 @@ export interface ArtifactRef {
   transparent: boolean;
   specHash: string;
   createdAt: string;
+  /**
+   * Set only on animate_image output. edit_image and animate_image refuse
+   * such a source: both work on a single still frame.
+   */
+  animation?: AnimationInfo;
 }
 
 export interface JobRecord {
@@ -109,7 +117,7 @@ export function jobToResult(job: JobRecord): Record<string, unknown> {
 
   if (job.status === "completed" && job.artifact) {
     const a = job.artifact;
-    out.artifact = {
+    const artifact: Record<string, unknown> = {
       project_id: a.projectId,
       asset_id: a.assetId,
       version: a.version,
@@ -121,6 +129,17 @@ export function jobToResult(job: JobRecord): Record<string, unknown> {
       transparent: a.transparent,
       created_at: a.createdAt,
     };
+    if (a.animation) {
+      artifact.animation = {
+        motion: a.animation.motion,
+        intensity: a.animation.intensity,
+        duration_ms: a.animation.durationMs,
+        frames: a.animation.frames,
+        fps: a.animation.fps,
+        gif_url: a.animation.gif.url,
+      };
+    }
+    out.artifact = artifact;
   }
 
   if (job.status === "failed") {
