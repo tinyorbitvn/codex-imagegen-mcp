@@ -1584,7 +1584,9 @@ gh release view v0.7.0 --json tagName,url -q '.tagName + " " + .url'
 ```
 Expected: the workflow succeeds and the release exists. `publish.yml` writes the release notes itself.
 
-- [ ] **Step 2: GitOps change**
+- [ ] **Step 2: GitOps change, in two commits**
+
+Order matters: a 0.6.x worker that dequeues an `animate` payload falls into its create branch, spends a Codex quota unit and publishes an unrelated image. Commit and push the image bump first, wait until **both** imagegen Deployments run `:0.7.0` (Step 3), and only then commit the allowlist change.
 
 In `~/Workspace/dc-fpt-argocd-platform`:
 - Set both `tag: "0.6.2"` in `custom-applications/imagegen-mcp/values.yaml` to `tag: "0.7.0"`.
@@ -1598,10 +1600,14 @@ grep -c 'tag: "0.7.0"' custom-applications/imagegen-mcp/values.yaml             
 helm dependency update custom-applications/agentgateway >/dev/null && helm template custom-applications/agentgateway >/dev/null && echo render-ok
 git status --porcelain | grep -E 'Chart.lock|charts/' && echo "REMOVE before commit"
 ```
-Then commit in Vietnamese without a footer and push:
+Then commit in Vietnamese without a footer, in this order:
 ```bash
-git add custom-applications/imagegen-mcp custom-applications/agentgateway
-git commit -m "feat(imagegen-mcp): nâng 0.7.0 — thêm tool animate_image (ảnh động WebP + GIF), mở allowlist ở agentgateway"
+git add custom-applications/imagegen-mcp
+git commit -m "feat(imagegen-mcp): nâng 0.7.0 — thêm tool animate_image (ảnh động WebP + GIF)"
+git push
+# ...Step 3 shows both Deployments on :0.7.0, then:
+git add custom-applications/agentgateway
+git commit -m "feat(agentgateway): mở allowlist cho animate_image"
 git push
 ```
 
