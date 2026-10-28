@@ -12,8 +12,10 @@
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import {
+  DEFAULT_ANIMATION_DURATION_MS,
   DEFAULT_CANVAS,
   ImagegenError,
+  clampAnimationDuration,
   MIME_BY_FORMAT,
   jobToResult,
   resolveStyle,
@@ -21,6 +23,9 @@ import {
   sanitizeIdentifier,
 } from "../contracts/index.ts";
 import type {
+  AnimationIntensity,
+  AnimationMotion,
+  ArtifactRef,
   AspectRatio,
   ImageSpec,
   JobRecord,
@@ -171,16 +176,7 @@ export class ImagegenService {
     const instructions = sanitizeFreeText(raw.instructions, "instructions");
     const sourceVersion = raw.source_version as number | undefined;
 
-    const source = await this.#store.getArtifact(projectId, assetId, sourceVersion);
-    if (!source?.artifact) {
-      throw new ImagegenError(
-        "JOB_NOT_FOUND",
-        `No artifact ${projectId}/${assetId}` +
-          (sourceVersion ? ` version ${sourceVersion}` : ""),
-      );
-    }
-
-    const src = source.artifact;
+    const src = await this.#stillSource(projectId, assetId, sourceVersion);
     const outputFormat: OutputFormat = src.mimeType === "image/webp" ? "webp" : "png";
 
     const spec: ImageSpec = {
@@ -215,6 +211,82 @@ export class ImagegenService {
     });
 
     return { job_id: jobId, status: "queued" };
+  }
+
+  // ---------------------------------------------------------------
+  // animate_image — motion presets on a still, rendered by the worker
+  // ---------------------------------------------------------------
+  async animateImage(raw: Record<string, unknown>, principal: string): Promise<JobHandle> {
+    const projectId = sanitizeIdentifier(raw.project_id, "project");
+    const assetId = sanitizeIdentifier(raw.asset_id, "asset_id");
+    // motion/intensity are enums checked by zod at the tool boundary.
+    const motion = raw.motion as AnimationMotion;
+    const intensity = (raw.intensity as AnimationIntensity | undefined) ?? "medium";
+    const durationMs = clampAnimationDuration(
+      (raw.duration_ms as number | undefined) ?? DEFAULT_ANIMATION_DURATION_MS[motion],
+    );
+
+    const src = await this.#stillSource(projectId, assetId, raw.source_version as number | undefined);
+
+    const spec: ImageSpec = {
+      projectId,
+      assetId,
+      description: `animate_image: ${motion}`,
+      stylePrompt: "",
+      styleReference: null,
+      aspectRatio: "1:1",
+      width: src.width,
+      height: src.height,
+      transparentBackground: src.transparent,
+      outputFormat: "webp",
+      isolatedObject: true,
+      safePaddingPercent: 0,
+      filename: "animation.webp",
+    };
+
+    const version = (await this.#store.highestAllocatedVersion(projectId, assetId)) + 1;
+    const jobId = newJobId();
+
+    await this.#store.create(this.#newRecord(jobId, spec, version, src.version, principal));
+    await this.#queue.enqueue({
+      jobId,
+      kind: "animate",
+      spec,
+      version,
+      parentVersion: src.version,
+      sourceKey: src.key,
+      instructions: null,
+      animation: { motion, intensity, durationMs },
+    });
+
+    return { job_id: jobId, status: "queued" };
+  }
+
+  /**
+   * The still an edit or an animation starts from. Animated artifacts are
+   * refused: Codex edits and the motion presets both work on one frame.
+   */
+  async #stillSource(
+    projectId: string,
+    assetId: string,
+    version: number | undefined,
+  ): Promise<ArtifactRef> {
+    const source = await this.#store.getArtifact(projectId, assetId, version);
+    if (!source?.artifact) {
+      throw new ImagegenError(
+        "JOB_NOT_FOUND",
+        `No artifact ${projectId}/${assetId}` + (version ? ` version ${version}` : ""),
+      );
+    }
+    const src = source.artifact;
+    if (src.animation) {
+      throw new ImagegenError(
+        "UNSUPPORTED_FORMAT",
+        `${projectId}/${assetId} version ${src.version} is an animation; ` +
+          "pass source_version of a still image.",
+      );
+    }
+    return src;
   }
 
   // ---------------------------------------------------------------

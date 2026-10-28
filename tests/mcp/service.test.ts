@@ -25,6 +25,7 @@ async function completePayload(
   payload: JobPayload,
   store: InMemoryJobStore,
   queue: InMemoryJobQueue,
+  extra: Partial<ArtifactRef> = {},
 ): Promise<ArtifactRef> {
   const { spec, version, parentVersion, jobId } = payload;
   const artifact: ArtifactRef = {
@@ -40,6 +41,7 @@ async function completePayload(
     transparent: spec.transparentBackground,
     specHash: "deadbeef",
     createdAt: new Date().toISOString(),
+    ...extra,
   };
   await store.markCompleted(jobId, artifact);
   await queue.ack(jobId);
@@ -396,6 +398,65 @@ describe("waitForImage — waiting and progress reporting", () => {
     await assert.rejects(
       () => service.waitForImage({ job_id: "img_doesnotexist", timeout_seconds: 10 }, { pollMs: 5 }),
       (e: unknown) => (e as ImagegenError).code === "JOB_NOT_FOUND",
+    );
+  });
+});
+
+describe("animate_image", () => {
+  async function withStill() {
+    const b = build();
+    await b.service.createImage({ project_id: "p", asset_id: "a", description: "a bell" }, "claude-design");
+    await completeNextJob(b.queue, b.store);
+    return b;
+  }
+
+  test("queues an animate job on a new version, pointing at the still", async () => {
+    const { service, queue } = await withStill();
+    const r = await service.animateImage({ project_id: "p", asset_id: "a", motion: "spin" }, "claude-design");
+    assert.match(r.job_id, /^img_[0-9a-f]{32}$/);
+    const payload = (await queue.dequeue(1000))!;
+    assert.equal(payload.kind, "animate");
+    assert.equal(payload.version, 2);
+    assert.equal(payload.parentVersion, 1);
+    assert.match(payload.sourceKey!, /\/v1\//);
+    assert.equal(payload.spec.filename, "animation.webp");
+    assert.deepEqual(payload.animation, { motion: "spin", intensity: "medium", durationMs: 1200 });
+  });
+
+  test("duration_ms outside 400-4000 is clamped, not rejected", async () => {
+    const { service, queue } = await withStill();
+    await service.animateImage({ project_id: "p", asset_id: "a", motion: "pulse", duration_ms: 50 }, "x");
+    assert.equal((await queue.dequeue(1000))!.animation!.durationMs, 400);
+    await service.animateImage({ project_id: "p", asset_id: "a", motion: "pulse", duration_ms: 100_000 }, "x");
+    assert.equal((await queue.dequeue(1000))!.animation!.durationMs, 4000);
+  });
+
+  test("an animated source is refused by name, for animate and edit alike", async () => {
+    const { service, store, queue } = await withStill();
+    await service.animateImage({ project_id: "p", asset_id: "a", motion: "spin" }, "x");
+    await completePayload((await queue.dequeue(1000))!, store, queue, {
+      mimeType: "image/webp",
+      animation: {
+        motion: "spin", intensity: "medium", durationMs: 1200, frames: 29, fps: 24,
+        gif: { key: "projects/p/a/v2/animation.gif", url: "https://s3.example/v2/animation.gif" },
+      },
+    });
+
+    const refused = (e: unknown) =>
+      e instanceof ImagegenError && e.code === "UNSUPPORTED_FORMAT" && /version 2/.test(e.message);
+    await assert.rejects(() => service.animateImage({ project_id: "p", asset_id: "a", motion: "pulse" }, "x"), refused);
+    await assert.rejects(() => service.editImage({ project_id: "p", asset_id: "a", instructions: "x" }, "x"), refused);
+
+    // The still underneath is still fair game.
+    await service.animateImage({ project_id: "p", asset_id: "a", motion: "pulse", source_version: 1 }, "x");
+    assert.equal((await queue.dequeue(1000))!.parentVersion, 1);
+  });
+
+  test("animating a missing asset reports JOB_NOT_FOUND", async () => {
+    const { service } = build();
+    await assert.rejects(
+      () => service.animateImage({ project_id: "p", asset_id: "missing", motion: "spin" }, "x"),
+      (e: unknown) => e instanceof ImagegenError && e.code === "JOB_NOT_FOUND",
     );
   });
 });

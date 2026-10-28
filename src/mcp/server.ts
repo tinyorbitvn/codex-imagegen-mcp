@@ -25,6 +25,7 @@ import {
   ImagegenError,
   log,
   toImagegenError,
+  animateImageSchema,
   cancelImageJobSchema,
   createImageSchema,
   editImageSchema,
@@ -247,6 +248,35 @@ function buildMcpServer(req: Request, service: ImagegenService): McpServer {
       try {
         const a = args as Record<string, unknown>;
         const handle = await service.editImage(a, principal);
+        return ok(await runAndMaybeWait(handle, a, extra, service));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "animate_image",
+    {
+      title: "Animate existing artifact",
+      description:
+        "Turns a still artifact into a short looping animation and saves it " +
+        "as a NEW VERSION: an animated WebP at artifact.url, plus a GIF " +
+        "fallback at artifact.animation.gif_url. The object moves as a " +
+        "whole (spin, pulse, shake, bounce or float); it does not change " +
+        "pose. Uses no image-generation quota and takes a few seconds once " +
+        "the worker is free.\n\n" +
+        "Best source: create_image with isolated_object=true and a " +
+        "transparent background. GIF transparency is 1-bit, so soft edges " +
+        "look jagged in the GIF; prefer the WebP on the web. Waits and " +
+        "reports progress like create_image; wait=false returns the job_id " +
+        "right away.",
+      inputSchema: animateImageSchema,
+    },
+    async (args, extra) => {
+      try {
+        const a = args as Record<string, unknown>;
+        const handle = await service.animateImage(a, principal);
         return ok(await runAndMaybeWait(handle, a, extra, service));
       } catch (e) {
         return fail(e);
