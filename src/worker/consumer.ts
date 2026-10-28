@@ -20,6 +20,7 @@ import { classifyCodexFailure, retryHintFrom, runCodex } from "./runner.ts";
 import type { CodexResult } from "./runner.ts";
 import { metrics } from "./metrics.ts";
 import { readImageInfo } from "./imagesize.ts";
+import { renderAnimation } from "./animate.ts";
 
 /** Lets tests swap the real Codex for a fake function. */
 export type CodexRunner = (opts: {
@@ -283,6 +284,15 @@ export class Consumer {
       // can ever read another job's directory.
       await mkdir(jobDir, { recursive: true, mode: 0o700 });
 
+      // animate_image never reaches Codex: no quota, no prompt, no salvage.
+      if (payload.kind === "animate") {
+        const done = await this.#animate(payload, jobDir);
+        uploadMs = done.uploadMs;
+        await this.#store.markCompleted(jobId, done.artifact);
+        ok = true;
+        return;
+      }
+
       let prompt: string;
       if (payload.kind === "edit") {
         const sourceFilename = `source.${spec.outputFormat}`;
@@ -484,6 +494,78 @@ export class Consumer {
         artifact_upload_duration_ms: uploadMs,
       });
     }
+  }
+
+  /**
+   * Renders an animate_image job from a still the worker made earlier.
+   * The service has already refused animated sources, so the source is a
+   * single frame.
+   */
+  async #animate(
+    payload: JobPayload,
+    jobDir: string,
+  ): Promise<{ artifact: ArtifactRef; uploadMs: number }> {
+    const { spec, version } = payload;
+    const request = payload.animation!;
+    const source = await this.#storage.download(payload.sourceKey!);
+    const out = await renderAnimation(source, request);
+
+    const webpPath = join(jobDir, "animation.webp");
+    const gifPath = join(jobDir, "animation.gif");
+    await writeFile(webpPath, out.webp, { mode: 0o600 });
+    await writeFile(gifPath, out.gif, { mode: 0o600 });
+
+    const key = artifactKey(spec.projectId, spec.assetId, version, "animation.webp");
+    const gifKey = artifactKey(spec.projectId, spec.assetId, version, "animation.gif");
+    const webpUpload = await this.#storage.uploadArtifact(webpPath, key, "image/webp");
+    const gifUpload = await this.#storage.uploadArtifact(gifPath, gifKey, "image/gif");
+    const uploadMs = webpUpload.durationMs + gifUpload.durationMs;
+    metrics.uploaded(uploadMs / 1000);
+
+    const artifact: ArtifactRef = {
+      projectId: spec.projectId,
+      assetId: spec.assetId,
+      version,
+      parentVersion: payload.parentVersion,
+      key,
+      url: webpUpload.url,
+      mimeType: "image/webp",
+      width: out.width,
+      height: out.height,
+      // The canvas is transparent whatever the source was.
+      transparent: true,
+      specHash: specHash(JSON.stringify(request)),
+      createdAt: new Date().toISOString(),
+      animation: { ...request, frames: out.frames, fps: out.fps, gif: { key: gifKey, url: gifUpload.url } },
+    };
+
+    await this.#storage.uploadMetadata(
+      artifactKey(spec.projectId, spec.assetId, version, "metadata.json"),
+      {
+        project_id: artifact.projectId,
+        asset_id: artifact.assetId,
+        version: artifact.version,
+        parent_version: artifact.parentVersion,
+        job_id: payload.jobId,
+        content_type: artifact.mimeType,
+        width: artifact.width,
+        height: artifact.height,
+        transparent: artifact.transparent,
+        animation: {
+          motion: request.motion,
+          intensity: request.intensity,
+          duration_ms: request.durationMs,
+          frames: out.frames,
+          fps: out.fps,
+          gif_key: gifKey,
+        },
+        spec_hash: artifact.specHash,
+        generator: "animate-preset",
+        created_at: artifact.createdAt,
+      },
+    );
+
+    return { artifact, uploadMs };
   }
 }
 

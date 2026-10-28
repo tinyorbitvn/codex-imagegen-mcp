@@ -11,6 +11,7 @@ import { mkdtemp, rm, writeFile, readdir, readFile, mkdir, utimes } from "node:f
 import { tmpdir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { join } from "node:path";
+import sharp from "sharp";
 
 import type { ImageSpec, JobPayload, JobRecord } from "../../src/contracts/index.ts";
 import { InMemoryJobQueue, InMemoryJobStore } from "../../src/queue/index.ts";
@@ -515,5 +516,96 @@ describe("pruneGeneratedImages — keeps Codex's image store from growing withou
 
   test("a nonexistent store returns 0, doesn't throw", async () => {
     assert.equal(await pruneGeneratedImages(join(tmpdir(), "does-not-exist-xyz"), 1000), 0);
+  });
+});
+
+describe("consumer — animate_image", () => {
+  const SOURCE_KEY = "projects/tinyorbit-cloud/bell/v1/artifact.png";
+
+  async function seed(storage: FakeStorage, body?: Buffer): Promise<void> {
+    storage.objects.set(
+      SOURCE_KEY,
+      body ??
+        (await sharp({
+          create: { width: 64, height: 64, channels: 4, background: { r: 200, g: 150, b: 0, alpha: 1 } },
+        })
+          .png()
+          .toBuffer()),
+    );
+  }
+
+  function animatePayload(jobId: string): JobPayload {
+    return {
+      jobId,
+      kind: "animate",
+      spec: spec({ assetId: "bell", outputFormat: "webp", filename: "animation.webp", width: 64, height: 64 }),
+      version: 2,
+      parentVersion: 1,
+      sourceKey: SOURCE_KEY,
+      instructions: null,
+      animation: { motion: "shake", intensity: "medium", durationMs: 800 },
+    };
+  }
+
+  const codexMustNotRun: CodexRunner = async () => {
+    throw new Error("Codex must not run for animate_image");
+  };
+
+  test("renders WebP, GIF and metadata without running Codex", async () => {
+    const { consumer, store, queue, storage } = build(codexMustNotRun);
+    await seed(storage);
+    const p = animatePayload("img_anim1");
+    await store.create(record(p.jobId, p.spec, 2));
+    await queue.enqueue(p);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "completed");
+    const a = (await store.get(p.jobId))!.artifact!;
+    assert.equal(a.key, "projects/tinyorbit-cloud/bell/v2/animation.webp");
+    assert.equal(a.mimeType, "image/webp");
+    assert.equal(a.parentVersion, 1);
+    assert.equal(a.transparent, true);
+    assert.equal(a.animation!.motion, "shake");
+    assert.equal(a.animation!.frames, 19);
+    assert.equal(a.animation!.gif.key, "projects/tinyorbit-cloud/bell/v2/animation.gif");
+    assert.equal(a.animation!.gif.url, `https://s3.example/${a.animation!.gif.key}`);
+    assert.ok(storage.objects.has(a.key) && storage.objects.has(a.animation!.gif.key));
+
+    const meta = storage.metadata.get("projects/tinyorbit-cloud/bell/v2/metadata.json") as Record<string, unknown>;
+    assert.equal(meta.generator, "animate-preset");
+    assert.equal(meta.content_type, "image/webp");
+    const m = await sharp(storage.objects.get(a.key)!, { animated: true }).metadata();
+    assert.equal(m.pages, 19);
+  });
+
+  test("a source that is not an image fails with the renderer's reason", async () => {
+    const { consumer, store, queue, storage } = build(codexMustNotRun);
+    await seed(storage, Buffer.from("junk"));
+    const p = animatePayload("img_anim2");
+    await store.create(record(p.jobId, p.spec, 2));
+    await queue.enqueue(p);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "failed");
+    const job = (await store.get(p.jobId))!;
+    assert.equal(job.errorCode, "IMAGE_GENERATION_FAILED");
+    assert.match(job.errorMessage ?? "", /^Could not render the animation: /);
+  });
+
+  test("an animate job cancelled while queued is never rendered", async () => {
+    const { consumer, store, queue, storage } = build(codexMustNotRun);
+    await seed(storage);
+    let downloads = 0;
+    const realDownload = storage.download.bind(storage);
+    storage.download = async (key: string) => {
+      downloads += 1;
+      return realDownload(key);
+    };
+    const p = animatePayload("img_anim3");
+    await store.create(record(p.jobId, p.spec, 2));
+    await queue.enqueue(p);
+    await queue.requestCancel(p.jobId);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "cancelled");
+    assert.equal(downloads, 0, "the source must not even be fetched");
+    assert.equal(storage.objects.has("projects/tinyorbit-cloud/bell/v2/animation.webp"), false);
   });
 });

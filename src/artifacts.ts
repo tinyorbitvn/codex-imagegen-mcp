@@ -21,16 +21,17 @@ import { log } from "./contracts/index.ts";
  * Content type by extension.
  *
  * Deliberately a short allowlist rather than a mime database: this
- * directory only ever holds what the worker uploads, which is one image
- * plus metadata.json. Anything else is something unexpected and gets
- * application/octet-stream, so a browser downloads it instead of running
- * it.
+ * directory only ever holds what the worker uploads: one image (or an
+ * animation and its GIF fallback) plus metadata.json. Anything else is
+ * something unexpected and gets application/octet-stream, so a browser
+ * downloads it instead of running it.
  */
 const CONTENT_TYPES: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
+  ".gif": "image/gif",
   ".json": "application/json",
 };
 

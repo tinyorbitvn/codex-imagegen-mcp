@@ -30,6 +30,7 @@ before(async () => {
     JSON.stringify({ version: 1 }),
   );
   await writeFile(join(root, "projects/tinyorbit-cloud/hero/v1/notes.bin"), "opaque");
+  await writeFile(join(root, "projects/tinyorbit-cloud/hero/v1/animation.gif"), "GIF89a");
   // A file OUTSIDE the artifact directory, standing in for anything on the
   // filesystem a traversal could reach.
   await writeFile(join(root, "..", "artifact-route-secret.txt"), "top secret");
@@ -53,6 +54,12 @@ describe("GET /artifacts", () => {
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "image/png");
     assert.deepEqual(Buffer.from(await res.arrayBuffer()), PNG);
+  });
+
+  test("serves the GIF fallback of an animation as image/gif", async () => {
+    const res = await fetch(`${base}/artifacts/projects/tinyorbit-cloud/hero/v1/animation.gif`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "image/gif");
   });
 
   test("serves metadata.json as JSON", async () => {
