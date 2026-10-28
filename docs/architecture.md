@@ -55,6 +55,7 @@ want several images in flight.
 |---|---|
 | `create_image` | Generates one image. Waits by default; returns `timed_out=true` rather than failing if it runs long. |
 | `edit_image` | Applies a change to an existing artifact and saves it as a NEW version. Never overwrites. |
+| `animate_image` | Turns a still artifact into a looping animated WebP plus a GIF fallback (spin, pulse, shake, bounce, float) as a NEW version. No Codex run, no quota. |
 | `get_image_job` | Job state: queued, running, completed, failed, cancelled. |
 | `get_artifact` | Artifact metadata and URL. Omit the version for the latest. |
 | `cancel_image_job` | Cancels a queued or running job. A finished job cannot be cancelled. |
@@ -96,6 +97,10 @@ uploads it to the store and returns the public URL. Codex also keeps its own
 copy under `$CODEX_HOME/generated_images`, about 0.7 MB per job, which the
 worker prunes on a retention window because nothing else will.
 
+An `animate` job skips Codex: the worker downloads the still, renders the
+motion with sharp, and uploads `animation.webp`, `animation.gif` and
+`metadata.json`.
+
 ## Source layout
 
 | Path | Contents |
@@ -106,4 +111,4 @@ worker prunes on a retention window because nothing else will.
 | `src/queue/` | Queue interface, in-memory implementation, Redis implementation. |
 | `src/storage/` | Store interface, local directory implementation, S3 implementation. |
 | `src/mcp/` | Tool registration, transport, and the service behind the tools. |
-| `src/worker/` | The consumer loop, the Codex runner, prompt building, image inspection, metrics. |
+| `src/worker/` | The consumer loop, the Codex runner, prompt building, image inspection, motion presets and the animation renderer, metrics. |

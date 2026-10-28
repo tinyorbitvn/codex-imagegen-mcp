@@ -75,6 +75,7 @@ too.
 |---|---|
 | `create_image` | Generates one image. Waits by default and reports progress; `wait=false` returns a job id immediately. |
 | `edit_image` | Applies a change to an existing artifact as a NEW version. Never overwrites. |
+| `animate_image` | Turns a still artifact into a looping animated WebP plus a GIF fallback (spin, pulse, shake, bounce, float) as a NEW version. No Codex run, no quota. |
 | `get_image_job` | queued, running, completed, failed or cancelled, plus the artifact URL when done. |
 | `get_artifact` | Artifact metadata and URL. Omit the version for the latest. |
 | `cancel_image_job` | Cancels a queued or running job. |
