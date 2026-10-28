@@ -91,12 +91,13 @@ export class RedisJobStore implements JobStore {
   }
 
   async markCompleted(jobId: string, artifact: ArtifactRef): Promise<void> {
-    const ok = await this.#update(jobId, (j) => ({
-      ...j,
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      artifact,
-    }));
+    // A cancelled job has given its version number back (markCancelled);
+    // completing it late would publish under a number the next job reuses.
+    const ok = await this.#update(jobId, (j) =>
+      j.status === "queued" || j.status === "running"
+        ? { ...j, status: "completed", completedAt: new Date().toISOString(), artifact }
+        : null,
+    );
     if (ok) {
       await this.#r.zadd(
         `done:${artifact.projectId}:${artifact.assetId}`,

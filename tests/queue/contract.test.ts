@@ -69,6 +69,19 @@ describe("JobStore — state invariants", () => {
     assert.equal((await s.get("img_1"))!.status, "completed");
   });
 
+  test("a cancelled job is NOT resurrected by a late markCompleted", async () => {
+    // cancel_image_job gives the version number back, so a late completion
+    // would publish under a number the next job is about to reuse.
+    const s = new InMemoryJobStore();
+    await s.create(record());
+    await s.markRunning("img_1");
+    assert.equal(await s.markCancelled("img_1"), true);
+    await s.markCompleted("img_1", artifact());
+    const j = (await s.get("img_1"))!;
+    assert.equal(j.status, "cancelled");
+    assert.equal(j.artifact, null);
+  });
+
   test("only a queued or running job can be cancelled", async () => {
     const s = new InMemoryJobStore();
     await s.create(record({ jobId: "img_q" }));

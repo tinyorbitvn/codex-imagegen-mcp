@@ -590,6 +590,26 @@ describe("consumer — animate_image", () => {
     assert.match(job.errorMessage ?? "", /^Could not render the animation: /);
   });
 
+  test("an animate job cancelled while it renders publishes nothing", async () => {
+    const { consumer, store, queue, storage } = build(codexMustNotRun);
+    await seed(storage);
+    const p = animatePayload("img_anim4");
+    const realDownload = storage.download.bind(storage);
+    // cancel_image_job arriving mid-job: flag for the worker, status for the client.
+    storage.download = async (key: string) => {
+      await queue.requestCancel(p.jobId);
+      await store.markCancelled(p.jobId);
+      return realDownload(key);
+    };
+    await store.create(record(p.jobId, p.spec, 2));
+    await queue.enqueue(p);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "cancelled");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal((await store.get(p.jobId))!.status, "cancelled");
+    assert.equal(storage.objects.has("projects/tinyorbit-cloud/bell/v2/animation.webp"), false);
+  });
+
   test("an animate job cancelled while queued is never rendered", async () => {
     const { consumer, store, queue, storage } = build(codexMustNotRun);
     await seed(storage);

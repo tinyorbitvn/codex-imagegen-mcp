@@ -509,6 +509,9 @@ export class Consumer {
     const request = payload.animation!;
     const source = await this.#storage.download(payload.sourceKey!);
     const out = await renderAnimation(source, request);
+    // The render is the long part, so this is where a cancel_image_job
+    // sent mid-job is honoured: nothing gets uploaded.
+    if (await this.#queue.isCancelled(payload.jobId)) throw new Error("CANCELLED");
 
     const webpPath = join(jobDir, "animation.webp");
     const gifPath = join(jobDir, "animation.gif");

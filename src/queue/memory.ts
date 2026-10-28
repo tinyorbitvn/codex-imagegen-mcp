@@ -39,7 +39,9 @@ export class InMemoryJobStore implements JobStore {
 
   async markCompleted(jobId: string, artifact: ArtifactRef): Promise<void> {
     const j = this.#jobs.get(jobId);
-    if (!j) return;
+    // Same rule as the Redis implementation: a cancelled job has given its
+    // version number back, so completing it late would publish over a reuse.
+    if (!j || (j.status !== "queued" && j.status !== "running")) return;
     j.status = "completed";
     j.completedAt = new Date().toISOString();
     j.artifact = artifact;
