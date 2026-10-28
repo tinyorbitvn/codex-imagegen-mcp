@@ -17,8 +17,11 @@ frame-by-frame edits) were considered and rejected for this iteration.
 
 - `animate_image` on a transparent, isolated icon returns a WebP and a GIF
   that loop seamlessly, with the last frame flowing into the first.
-- The job takes under 2 seconds of worker time once it reaches the front of
-  the queue.
+- Once the job reaches the front of the queue, worker time on the
+  deployment's 2 CPUs stays under 6 s at a motion's default duration and
+  under 16 s at the 4000 ms maximum. Measured 2026-10-28 with sharp 0.35.5
+  on a 512 px square, pinned to 2 cores: about 4 s for `spin` (29 frames)
+  and 14 s for 96 frames. WebP encoding is three quarters of that time.
 - Nothing is clipped while moving: a spinning square's corners stay on canvas.
 - `create_image`, `edit_image` and their artifacts behave exactly as before.
 
@@ -91,7 +94,8 @@ New module `src/worker/animate.ts`, using `sharp` (new dependency).
    vertical strip of raw RGBA.
 5. Encode the strip twice, using sharp's `pageHeight` multi-page input:
    - WebP with `loop: 0`, delay `1000/fps` per frame, alpha kept;
-   - GIF with `loop: 0`, same delay. GIF alpha is 1-bit, so soft edges on a
+   - GIF with `loop: 0`, same delay; GIF stores delays in centiseconds, so
+     42 ms becomes 40 ms and a GIF loop runs about 5% faster. GIF alpha is 1-bit, so soft edges on a
      transparent background look jagged. This is expected and noted in the
      tool description.
 
@@ -118,7 +122,7 @@ In `consumer.#handle`, an `animate` payload skips Codex entirely:
 Cancellation, status and `get_artifact` work unchanged.
 
 Trade-off accepted: the worker runs one job at a time, so an animate job can
-wait behind a 30–140 s Codex job. Rendering itself is sub-second. A separate
+wait behind a 30–140 s Codex job. Rendering itself takes 4–14 s. A separate
 fast lane would need a second queue and a second consumer loop. That is not
 worth it at this volume.
 
@@ -167,9 +171,9 @@ Rate limiting: none. The job is cheap, and the output is bounded at 512 px and
   - chart 0.3.0 with `appVersion` 0.7.0;
   - tag and GitHub Release, as the repository is public.
 - README and `docs/architecture.md` describe the new tool.
-- Dockerfile: `sharp` ships prebuilt libvips for linux-x64 and arm64 with GIF
-  support, so no system packages are needed. Check the image still builds on
-  both arches.
+- Dockerfile: `sharp` ships prebuilt libvips with GIF support for
+  linux-x64, so no system packages are needed. CI (`publish.yml`) builds
+  amd64 only; check the image builds and that `sharp` loads inside it.
 - GitOps, in `dc-fpt-argocd-platform`:
   - bump both image tags in `custom-applications/imagegen-mcp/values.yaml`
     together;
