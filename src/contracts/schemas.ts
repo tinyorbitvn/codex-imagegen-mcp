@@ -239,11 +239,12 @@ export const uploadImageSchema = {
     ),
 };
 
-/** Names of the 6 tools Claude Design gets to see. */
+/** Names of the 7 tools Claude Design gets to see. */
 export const PUBLIC_TOOLS = [
   "create_image",
   "edit_image",
   "animate_image",
+  "upload_image",
   "get_image_job",
   "get_artifact",
   "cancel_image_job",

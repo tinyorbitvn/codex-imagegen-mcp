@@ -31,6 +31,7 @@ import {
   editImageSchema,
   getArtifactSchema,
   getImageJobSchema,
+  uploadImageSchema,
 } from "../contracts/index.ts";
 
 import type { ImagegenService } from "./service.ts";
@@ -201,7 +202,8 @@ function buildMcpServer(req: Request, service: ImagegenService): McpServer {
         "isolated_object=true. Don't ask for one combined scene — a " +
         "combined scene can't be split into layers for animation.\n\n" +
         'Prefer style.reference (e.g. "tinyorbit-cloud-v1") over copying ' +
-        "the whole style description.",
+        "the whole style description.\n\n" +
+        "To draw from an image of your own, upload it with upload_image and pass reference_upload_ids.",
       inputSchema: createImageSchema,
     },
     async (args, extra) => {
@@ -209,6 +211,36 @@ function buildMcpServer(req: Request, service: ImagegenService): McpServer {
         const a = args as Record<string, unknown>;
         const handle = await service.createImage(a, principal);
         return ok(await runAndMaybeWait(handle, a, extra, service));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "upload_image",
+    {
+      title: "Upload your own image",
+      description:
+        "Stores an image of YOUR OWN (a logo, a photo, a sketch) so the other " +
+        "tools can use it: pass the returned upload_id to create_image " +
+        "(reference_upload_ids: Codex looks at it while drawing), edit_image " +
+        "(source_upload_id) or animate_image (source_upload_id).\n\n" +
+        "Two ways in:\n" +
+        "1. Small image: send data_base64 (raw base64 or a data: URI, at most " +
+        "700 KB decoded). It is stored at once.\n" +
+        "2. Up to 20 MB: send only content_type. You get upload.url and " +
+        "upload.fields. POST to upload.url as multipart/form-data with every " +
+        "entry of upload.fields first, in order, and the file last under the " +
+        "field name in upload.file_field. A 204 response means it is stored. " +
+        "The POST target expires after 15 minutes.\n\n" +
+        "Accepted: PNG, JPEG or WebP, a still image, 16-4096 px per side. " +
+        "Uploads are private and deleted automatically after about a day.",
+      inputSchema: uploadImageSchema,
+    },
+    async (args) => {
+      try {
+        return ok(await service.uploadImage(args as Record<string, unknown>));
       } catch (e) {
         return fail(e);
       }
@@ -241,7 +273,8 @@ function buildMcpServer(req: Request, service: ImagegenService): McpServer {
       description:
         "Applies a change to an existing artifact and saves it as a NEW " +
         "VERSION. Never overwrites the old one. Waits and reports progress " +
-        "like create_image; wait=false returns the job_id right away.",
+        "like create_image; wait=false returns the job_id right away. " +
+        "To edit an image of your own instead, upload it with upload_image and pass source_upload_id.",
       inputSchema: editImageSchema,
     },
     async (args, extra) => {
@@ -270,7 +303,8 @@ function buildMcpServer(req: Request, service: ImagegenService): McpServer {
         "transparent background. GIF transparency is 1-bit, so soft edges " +
         "look jagged in the GIF; prefer the WebP on the web. Waits and " +
         "reports progress like create_image; wait=false returns the job_id " +
-        "right away.",
+        "right away. To animate an image of your own, upload it with " +
+        "upload_image and pass source_upload_id.",
       inputSchema: animateImageSchema,
     },
     async (args, extra) => {
