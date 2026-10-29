@@ -200,33 +200,42 @@ export class ArtifactStorage implements ArtifactStore {
    * Replaces the bucket's CORS and lifecycle with exactly these rules: the
    * bucket belongs to this service. GET stays open to every origin because
    * artifacts are already public; POST is governed by the signed policy.
+   * Applied independently: a store without per-bucket CORS must still
+   * expire uploads.
    */
   async configureUploads(settings: UploadBucketSettings): Promise<void> {
-    await this.#client.send(
-      new PutBucketCorsCommand({
-        Bucket: this.#cfg.bucket,
-        CORSConfiguration: {
-          CORSRules: [
-            { AllowedMethods: ["POST"], AllowedOrigins: settings.corsOrigins, AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
-            { AllowedMethods: ["GET", "HEAD"], AllowedOrigins: ["*"], AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
-          ],
-        },
-      }),
-    );
-    await this.#client.send(
-      new PutBucketLifecycleConfigurationCommand({
-        Bucket: this.#cfg.bucket,
-        LifecycleConfiguration: {
-          Rules: [
-            {
-              ID: "expire-uploads",
-              Status: "Enabled",
-              Filter: { Prefix: "uploads/" },
-              Expiration: { Days: settings.retentionDays },
-            },
-          ],
-        },
-      }),
-    );
+    const results = await Promise.allSettled([
+      this.#client.send(
+        new PutBucketCorsCommand({
+          Bucket: this.#cfg.bucket,
+          CORSConfiguration: {
+            CORSRules: [
+              { AllowedMethods: ["POST"], AllowedOrigins: settings.corsOrigins, AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
+              { AllowedMethods: ["GET", "HEAD"], AllowedOrigins: ["*"], AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
+            ],
+          },
+        }),
+      ),
+      this.#client.send(
+        new PutBucketLifecycleConfigurationCommand({
+          Bucket: this.#cfg.bucket,
+          LifecycleConfiguration: {
+            Rules: [
+              {
+                ID: "expire-uploads",
+                Status: "Enabled",
+                Filter: { Prefix: "uploads/" },
+                Expiration: { Days: settings.retentionDays },
+              },
+            ],
+          },
+        }),
+      ),
+    ]);
+    const failed = ["CORS", "lifecycle"].flatMap((name, i) => {
+      const r = results[i]!;
+      return r.status === "rejected" ? [`${name} (${(r.reason as Error).name})`] : [];
+    });
+    if (failed.length > 0) throw new Error(`the bucket refused ${failed.join(" and ")}`);
   }
 }
