@@ -17,6 +17,7 @@ import {
   MAX_ANIMATION_DURATION_MS,
   MIN_ANIMATION_DURATION_MS,
 } from "./animation.ts";
+import { MAX_REFERENCE_UPLOADS, UPLOAD_CONTENT_TYPES } from "./upload.ts";
 
 export const ASPECT_RATIOS = ["1:1", "3:2", "2:3", "16:9", "9:16"] as const;
 export type AspectRatio = (typeof ASPECT_RATIOS)[number];
@@ -51,6 +52,16 @@ export const createImageSchema = {
     .string()
     .describe('Artifact id within the project, e.g. "homepage-hero-vps".'),
   description: z.string().describe("Description of the subject to draw."),
+  reference_upload_ids: z
+    .array(z.string())
+    .min(1)
+    .max(MAX_REFERENCE_UPLOADS)
+    .optional()
+    .describe(
+      "upload_ids from upload_image. Codex looks at these images while " +
+        "drawing: a logo to include, a product or character to keep " +
+        "consistent, a layout to follow.",
+    ),
   style: z
     .object({
       reference: z
@@ -135,6 +146,13 @@ export const editImageSchema = {
     .min(1)
     .optional()
     .describe("Source version. Omit for the latest version."),
+  source_upload_id: z
+    .string()
+    .optional()
+    .describe(
+      "upload_id from upload_image: edit your own image instead of an " +
+        "existing version. Do not combine with source_version.",
+    ),
   instructions: z.string().describe("The change to apply."),
   transparent_background: z.boolean().optional(),
   wait: z
@@ -170,6 +188,7 @@ export const animateImageSchema = {
     .min(1)
     .optional()
     .describe("Still image to animate. Omit for the latest version."),
+  source_upload_id: editImageSchema.source_upload_id,
   motion: z
     .enum(ANIMATION_MOTIONS)
     .describe(
@@ -201,6 +220,23 @@ export const getArtifactSchema = {
 
 export const cancelImageJobSchema = {
   job_id: z.string(),
+};
+
+export const uploadImageSchema = {
+  project_id: z
+    .string()
+    .describe("Project the upload belongs to; only tools in this project can use it."),
+  content_type: z
+    .enum(UPLOAD_CONTENT_TYPES)
+    .optional()
+    .describe("Required unless data_base64 is sent: it is signed into the POST target."),
+  data_base64: z
+    .string()
+    .optional()
+    .describe(
+      "The image inline, as raw base64 or a data: URI, at most 700 KB " +
+        "decoded. Omit it to get a POST target for files up to 20 MB.",
+    ),
 };
 
 /** Names of the 6 tools Claude Design gets to see. */

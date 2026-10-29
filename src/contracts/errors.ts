@@ -25,6 +25,10 @@ export const ERROR_CODES = [
   "CODEX_QUOTA_EXHAUSTED",
   "IMAGE_GENERATION_FAILED",
   "JOB_NOT_FOUND",
+  // An upload_id that was never issued, belongs to another project, or
+  // outlived the bucket's retention. Separate from JOB_NOT_FOUND because
+  // the fix is "upload it again", not "check the job id".
+  "UPLOAD_NOT_FOUND",
   "JOB_CANCELLED",
   "STORAGE_UPLOAD_FAILED",
   "INVALID_ASSET_ID",

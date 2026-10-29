@@ -4,6 +4,7 @@
 // without touching imports in either service.
 export * from "./errors.ts";
 export * from "./animation.ts";
+export * from "./upload.ts";
 export * from "./job.ts";
 export * from "./logger.ts";
 export * from "./sanitize.ts";

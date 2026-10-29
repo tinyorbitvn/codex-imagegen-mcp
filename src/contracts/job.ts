@@ -56,12 +56,14 @@ export interface JobPayload {
   version: number;
   /** Present when kind is "edit" or "animate". */
   parentVersion: number | null;
-  /** S3 key of the source image, present when kind is "edit" or "animate". */
+  /** S3 key of the source image (an artifact or an upload), present when kind is "edit" or "animate". */
   sourceKey: string | null;
   /** Only present when kind="edit": sanitized edit instructions. */
   instructions: string | null;
   /** Only present when kind="animate". */
   animation?: AnimationRequest;
+  /** Only for kind="create": upload keys Codex receives as reference images. */
+  referenceKeys?: string[];
 }
 
 export interface ArtifactRef {
