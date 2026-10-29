@@ -775,8 +775,28 @@ describe("consumer — salvage under concurrency", () => {
     assert.equal(storage.objects.get(key!)!.toString(), "FROM-thread-mine");
   });
 
+  test("takes its own thread's image even when the file's mtime is before the job started", async () => {
+    // The kernel stamps mtime from a coarse clock; measured 2026-10-29, 1004 of 2000 writes read back older than Date.now().
+    const { consumer, store, queue, storage } = build(async (opts) => {
+      const dir = join(opts.codexHome, "generated_images", "thread-coarse");
+      await mkdir(dir, { recursive: true });
+      const file = join(dir, "img-001.png");
+      await writeFile(file, Buffer.from("FROM-thread-coarse"));
+      const before = new Date(Date.now() - 10_000);
+      await utimes(file, before, before);
+      return { exitCode: 0, durationMs: 5, stderrTail: "", threadId: "thread-coarse" };
+    }, new FakeStorage(), 2);
+    const s = spec({ assetId: "coarse" });
+    await store.create(record("img_thread_coarse", s));
+    await queue.enqueue(payload("img_thread_coarse", s));
+    assert.equal(await runOnce(consumer, store, "img_thread_coarse"), "completed");
+    const key = [...storage.objects.keys()].find((k) => k.includes("/coarse/") && k.endsWith("artifact.png"));
+    assert.equal(storage.objects.get(key!)!.toString(), "FROM-thread-coarse");
+  });
+
   test("never takes another thread's image", async () => {
-    const { consumer, store, queue } = build(codexGeneratesInto("thread-other", "thread-mine"), new FakeStorage(), 2);
+    // Tests share one Codex home; a thread id no other test wrote to, as every real run's is.
+    const { consumer, store, queue } = build(codexGeneratesInto("thread-other", "thread-wrote-nothing"), new FakeStorage(), 2);
     const s = spec();
     await store.create(record("img_thread_2", s));
     await queue.enqueue(payload("img_thread_2", s));

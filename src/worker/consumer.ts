@@ -124,7 +124,10 @@ export async function salvageGeneratedImage(
       const full = join(root, session, f);
       try {
         const st = await stat(full);
-        if (st.mtimeMs >= startedAtMs && (!best || st.mtimeMs > best.mtimeMs)) {
+        // A thread's folder is this run's alone. The time cut is only for a
+        // scan of every folder, and mtime comes from a coarser clock than
+        // Date.now(), so a file written just after the start can read older.
+        if ((threadId || st.mtimeMs >= startedAtMs) && (!best || st.mtimeMs > best.mtimeMs)) {
           best = { path: full, mtimeMs: st.mtimeMs };
         }
       } catch {
