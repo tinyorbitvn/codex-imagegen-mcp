@@ -792,3 +792,54 @@ describe("consumer — salvage under concurrency", () => {
     assert.equal(await runOnce(consumer, store, "img_thread_3"), "failed");
   });
 });
+
+describe("consumer — one Codex at a time while a token refresh may run", () => {
+  async function runTwo(expiresInMs: number): Promise<number> {
+    const home = await mkdtemp(join(tmpdir(), "codex-home-"));
+    const jwt = `h.${Buffer.from(JSON.stringify({ exp: Math.floor((Date.now() + expiresInMs) / 1000) })).toString("base64url")}.s`;
+    await writeFile(join(home, "auth.json"), JSON.stringify({ tokens: { access_token: jwt }, last_refresh: new Date().toISOString() }));
+    let running = 0;
+    let most = 0;
+    const store = new InMemoryJobStore();
+    const queue = new InMemoryJobQueue();
+    const consumer = new Consumer({
+      store,
+      queue,
+      storage: new FakeStorage() as unknown as ArtifactStore,
+      config: { workDir: join(home, "jobs"), codexHome: home, codexBinary: "codex", jobTimeoutSeconds: 30, concurrency: 3 },
+      runner: async (opts) => {
+        running++;
+        most = Math.max(most, running);
+        await new Promise((r) => setTimeout(r, 150));
+        await codexOk(opts);
+        running--;
+        return { exitCode: 0, durationMs: 150, stderrTail: "", threadId: "t" };
+      },
+    });
+    for (const id of ["img_gate_a", "img_gate_b"]) {
+      const s = spec({ assetId: id });
+      await store.create(record(id, s));
+      await queue.enqueue(payload(id, s));
+    }
+    void consumer.run();
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const done = await Promise.all(["img_gate_a", "img_gate_b"].map(async (id) => (await store.get(id))?.status));
+      if (done.every((s) => s === "completed")) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    consumer.stop();
+    await new Promise((r) => setTimeout(r, 60));
+    await rm(home, { recursive: true, force: true });
+    return most;
+  }
+
+  test("runs jobs side by side while the access token has long to live", async () => {
+    assert.equal(await runTwo(10 * 24 * 3_600_000), 2);
+  });
+
+  test("runs them one at a time when expiry is close enough for Codex to refresh", async () => {
+    // Two processes refreshing at once: the second gets "refresh token was already used".
+    assert.equal(await runTwo(10 * 60_000), 1);
+  });
+});

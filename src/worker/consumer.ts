@@ -24,6 +24,7 @@ import { metrics } from "./metrics.ts";
 import { readImageInfo } from "./imagesize.ts";
 import { renderAnimation } from "./animate.ts";
 import { normaliseUpload } from "../uploads.ts";
+import { CODEX_REFRESH_WINDOW_MS, readCodexAuth, refreshMayRun } from "./codexauth.ts";
 
 /** Lets tests swap the real Codex for a fake function. */
 export type CodexRunner = (opts: {
@@ -241,6 +242,7 @@ export class Consumer {
   #runCodex: CodexRunner;
   #stopping = false;
   #active = 0;
+  #slots = { value: 1, checkedAt: 0 };
 
   constructor(deps: ConsumerDeps) {
     this.#store = deps.store;
@@ -256,6 +258,27 @@ export class Consumer {
 
   stop(): void {
     this.#stopping = true;
+  }
+
+  /**
+   * Jobs allowed to run right now: one while Codex may refresh its
+   * sign-in (see codexauth.ts), the configured number otherwise. The
+   * guard covers a whole job, so a job started outside it ends before
+   * Codex's refresh window opens. Re-read every 5 s, not every 100 ms.
+   */
+  async #allowedSlots(): Promise<number> {
+    if (this.#cfg.concurrency <= 1) return this.#cfg.concurrency;
+    const now = Date.now();
+    if (now - this.#slots.checkedAt < 5000) return this.#slots.value;
+    const guardMs = this.#cfg.jobTimeoutSeconds * 1000 + CODEX_REFRESH_WINDOW_MS + 5 * 60_000;
+    const value = refreshMayRun(await readCodexAuth(this.#cfg.codexHome), now, guardMs) ? 1 : this.#cfg.concurrency;
+    if (value !== this.#slots.value && this.#slots.checkedAt !== 0) {
+      log.info(value === 1 ? "one Codex at a time while its sign-in may refresh" : "Codex sign-in refreshed, jobs run side by side again", {
+        concurrency: value,
+      });
+    }
+    this.#slots = { value, checkedAt: now };
+    return value;
   }
 
   /**
@@ -283,7 +306,7 @@ export class Consumer {
     });
 
     while (!this.#stopping) {
-      if (this.#active >= this.#cfg.concurrency) {
+      if (this.#active >= (await this.#allowedSlots())) {
         await sleep(100);
         continue;
       }
