@@ -73,9 +73,15 @@ export async function inspectUpload(buf: Buffer): Promise<UploadInfo> {
 
 /** Upright, metadata-free bytes in the format the job works in. */
 export async function normaliseUpload(buf: Buffer, format: "png" | "webp"): Promise<Buffer> {
+  // Inspected again here, not trusted from submit time: a POST target stays
+  // writable for 15 minutes, so the bytes can change before the worker reads them.
+  await inspectUpload(buf);
   // rotate() with no angle applies the EXIF orientation; sharp drops
   // metadata on output unless asked to keep it.
-  return sharp(buf).rotate().toFormat(format).toBuffer();
+  return sharp(buf, { limitInputPixels: MAX_UPLOAD_SIDE * MAX_UPLOAD_SIDE })
+    .rotate()
+    .toFormat(format)
+    .toBuffer();
 }
 
 export function decodeInlineUpload(data: string): Buffer {

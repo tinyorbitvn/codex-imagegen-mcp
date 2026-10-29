@@ -66,6 +66,12 @@ test("normalising turns the image upright and drops its metadata", async () => {
   assert.equal(out.exif, undefined);
 });
 
+test("normalising re-checks the bytes, since a reused POST target can swap them after submit", async () => {
+  const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"/>');
+  await assert.rejects(normaliseUpload(svg, "png"), refused(/is svg/));
+  await assert.rejects(normaliseUpload(await solid(4097, 16).png().toBuffer(), "png"), refused(/4096/));
+});
+
 test("inline data is read from raw base64 or a data URI", () => {
   const bytes = Buffer.from([1, 2, 3, 250]);
   assert.deepEqual(decodeInlineUpload(bytes.toString("base64")), bytes);
