@@ -61,7 +61,7 @@ the key, a plain unsigned GET, so that bucket has to allow anonymous download.
 |---|---|---|
 | `RATE_LIMIT_CREATE_IMAGE_PER_HOUR` | `10` | Per caller. `0` turns the limit off. |
 | `RATE_LIMIT_EDIT_IMAGE_PER_HOUR` | `20` | Per caller. `0` turns the limit off. |
-| `UPLOAD_CORS_ORIGINS` | `*` | Comma-separated origins allowed to POST an upload from a browser. The signed POST policy is the credential; this only limits which pages may send it. |
+| `UPLOAD_CORS_ORIGINS` | `*` | Comma-separated origins allowed to POST an upload from a browser. The signed POST policy is the credential; this only limits which pages may send it. Applied by the role that runs the worker. |
 | `UPLOAD_RETENTION_DAYS` | `1` | Days before the bucket deletes `uploads/`. Applied as a lifecycle rule at startup; at least 1. |
 
 The caller identity is taken from the first header present out of
@@ -69,10 +69,16 @@ The caller identity is taken from the first header present out of
 otherwise. With no authenticating proxy in front, every caller shares the
 `anonymous` bucket.
 
-With S3 storage the MCP role needs the bucket credentials too: it presigns
-upload targets, writes inline uploads and inspects every upload before a job
-is queued. At startup it sets the bucket's CORS and lifecycle rules,
-replacing any that were there.
+With S3 storage the MCP role needs credentials too: it presigns upload
+targets, writes inline uploads and inspects every upload before a job is
+queued. It does not need the bucket owner's key. `s3:PutObject` and
+`s3:GetObject` on `uploads/*`, plus `s3:ListBucket` limited to the `uploads/`
+prefix (so a missing upload is a 404, not a 403), are enough. Every upload is
+written with the ACL `bucket-owner-full-control`, so the worker can read it
+when the two roles use different keys.
+
+The role that runs the worker (`worker` or `all`) sets the bucket's CORS and
+lifecycle rules at startup, replacing any that were there.
 
 ## What is deliberately absent
 
