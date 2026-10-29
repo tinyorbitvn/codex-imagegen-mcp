@@ -3,7 +3,8 @@
 // This is the ONLY component that touches the ChatGPT credential. Neither
 // agentgateway, imagegen-mcp, nor Redis can mount the codex-home PVC.
 
-import { mkdir, writeFile, rm, access, readdir, stat, copyFile } from "node:fs/promises";
+import { mkdir, writeFile, rm, access, readdir, stat, copyFile, rename } from "node:fs/promises";
+import sharp from "sharp";
 import { join } from "node:path";
 import {
   ImagegenError,
@@ -16,7 +17,7 @@ import type { ArtifactRef, JobPayload, OutputFormat } from "../contracts/index.t
 import type { JobQueue, JobStore } from "../queue/index.ts";
 import type { ArtifactStore } from "../storage/index.ts";
 
-import { buildCreatePrompt, buildEditPrompt, specHash } from "./prompt.ts";
+import { buildCreatePrompt, buildEditPrompt, GENERATED_FILENAME, specHash } from "./prompt.ts";
 import { classifyCodexFailure, retryHintFrom, runCodex } from "./runner.ts";
 import type { CodexResult } from "./runner.ts";
 import { metrics } from "./metrics.ts";
@@ -96,11 +97,15 @@ export async function salvageGeneratedImage(
   codexHome: string,
   target: string,
   startedAtMs: number,
+  threadId?: string,
 ): Promise<string | null> {
   const root = join(codexHome, "generated_images");
+  // The folder is named after Codex's thread id. Knowing it is what makes
+  // salvage safe while several jobs run: the newest file in the whole
+  // store may belong to another job.
   let sessions: string[];
   try {
-    sessions = await readdir(root);
+    sessions = threadId ? [threadId] : await readdir(root);
   } catch {
     return null;
   }
@@ -132,6 +137,37 @@ export async function salvageGeneratedImage(
   return best.path;
 }
 
+
+async function firstExisting(paths: readonly string[]): Promise<string | null> {
+  for (const p of paths) {
+    try {
+      await access(p);
+      return p;
+    } catch {
+      /* try the next one */
+    }
+  }
+  return null;
+}
+
+/**
+ * Writes `src` to `dest` in `format`. A file already in that format is
+ * moved as is, so a PNG is never re-encoded; one sharp cannot read is
+ * moved too, and readImageInfo then logs it.
+ */
+export async function toRequestedFormat(src: string, dest: string, format: OutputFormat): Promise<void> {
+  let current: string | undefined;
+  try {
+    current = (await sharp(src).metadata()).format;
+  } catch {
+    current = undefined;
+  }
+  if (current === undefined || current === format) {
+    if (src !== dest) await rename(src, dest);
+    return;
+  }
+  await sharp(src).toFormat(format).toFile(dest);
+}
 
 /**
  * Cleans up old images in the image-generation tool's own private store.
@@ -219,10 +255,22 @@ export class Consumer {
   }
 
   /**
+   * Salvage from this job's own thread. Without a thread id the whole
+   * store is searched, which is only safe when no other job can be
+   * running: otherwise it may hand back another job's image, which is
+   * worse than none.
+   */
+  #salvage(target: string, started: number, threadId: string | undefined): Promise<string | null> {
+    if (!threadId && this.#cfg.concurrency > 1) return Promise.resolve(null);
+    return salvageGeneratedImage(this.#cfg.codexHome, target, started, threadId);
+  }
+
+  /**
    * Main loop. Runs until stop() is called.
    *
-   * Concurrency defaults to 1: one ChatGPT session can only drive one
-   * Codex process at a time. Configurable to raise later, but do NOT raise the default.
+   * Concurrency defaults to 1. Every job spends the same ChatGPT account,
+   * so raising it spends the quota faster; it does not change how much
+   * there is.
    */
   async run(): Promise<void> {
     log.info("consumer started", {
@@ -352,12 +400,13 @@ export class Consumer {
 
       // Codex exiting 0 does NOT guarantee the file landed where expected
       // — see salvageGeneratedImage. Check, then salvage, before
-      // concluding it failed.
+      // concluding it failed. The final name is still accepted in case
+      // Codex writes it directly, as prompts before 0.8.2 asked.
       const outPath = join(jobDir, spec.filename);
-      try {
-        await access(outPath);
-      } catch {
-        const saved = await salvageGeneratedImage(this.#cfg.codexHome, outPath, started);
+      const generated = join(jobDir, GENERATED_FILENAME);
+      let produced = await firstExisting([generated, outPath]);
+      if (!produced) {
+        const saved = await this.#salvage(generated, started, result.threadId);
         if (!saved) {
           log.warn("codex exited 0 but produced no image, and none could be salvaged", {
             job_id: jobId,
@@ -373,7 +422,9 @@ export class Consumer {
         log.warn("codex did not place the image correctly — salvaged it from generated_images", {
           job_id: jobId,
         });
+        produced = generated;
       }
+      await toRequestedFormat(produced, outPath, spec.outputFormat);
 
       // *** MEASURE THE REAL IMAGE, DON'T ECHO THE REQUEST ***
       // The old version wrote `width: spec.width` — i.e. it re-declared

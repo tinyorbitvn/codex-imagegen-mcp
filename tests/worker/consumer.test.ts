@@ -100,7 +100,7 @@ class FakeStorage {
 
 /** Fake Codex that succeeds: writes out exactly the file the instructions ask for. */
 const codexOk: CodexRunner = async (opts) => {
-  const m = /Save the (?:final generated asset|edited artifact) to exactly this path: (.+)$/m.exec(
+  const m = /Copy the (?:generated|edited) image, unchanged, to exactly this path: (.+)$/m.exec(
     opts.prompt,
   );
   assert.ok(m, "the instructions must state the output path");
@@ -112,7 +112,7 @@ function codexFailing(stderr: string): CodexRunner {
   return async () => ({ exitCode: 1, durationMs: 5, stderrTail: stderr });
 }
 
-function build(runner: CodexRunner, storage = new FakeStorage()) {
+function build(runner: CodexRunner, storage = new FakeStorage(), concurrency = 1) {
   const store = new InMemoryJobStore();
   const queue = new InMemoryJobQueue();
   const consumer = new Consumer({
@@ -124,7 +124,7 @@ function build(runner: CodexRunner, storage = new FakeStorage()) {
       codexHome: join(workRoot, "codex"),
       codexBinary: "codex",
       jobTimeoutSeconds: 30,
-      concurrency: 1,
+      concurrency,
     },
     runner,
   });
@@ -413,7 +413,7 @@ describe("consumer — metadata must MEASURE the image, not echo the request", (
 
   function codexReturning(buf: Buffer): CodexRunner {
     return async (opts) => {
-      const m = /Save the (?:final generated asset|edited artifact) to exactly this path: (.+)$/m.exec(
+      const m = /Copy the (?:generated|edited) image, unchanged, to exactly this path: (.+)$/m.exec(
         opts.prompt,
       );
       await writeFile(m![1]!.trim(), buf);
@@ -713,5 +713,65 @@ describe("consumer — uploads", () => {
     const job = (await store.get(p.jobId))!;
     assert.equal(job.errorCode, "UPLOAD_NOT_FOUND");
     assert.match(job.errorMessage ?? "", /upload it again/);
+  });
+});
+
+describe("consumer — the worker converts, Codex only copies", () => {
+  test("a PNG from Codex becomes the WebP the client asked for", async () => {
+    const png = await sharp({ create: { width: 64, height: 48, channels: 4, background: "#3a7c" } }).png().toBuffer();
+    const { consumer, store, queue, storage } = build(async (opts) => {
+      const m = /exactly this path: (.+)$/m.exec(opts.prompt);
+      await writeFile(m![1]!.trim(), png);
+      return { exitCode: 0, durationMs: 5, stderrTail: "", threadId: "t-convert" };
+    });
+    const s = spec({ outputFormat: "webp", filename: "artifact.webp" });
+    await store.create(record("img_convert_1", s));
+    await queue.enqueue(payload("img_convert_1", s));
+
+    assert.equal(await runOnce(consumer, store, "img_convert_1"), "completed");
+    const key = [...storage.objects.keys()].find((k) => k.endsWith("/artifact.webp"));
+    assert.ok(key, "uploaded under the requested filename");
+    const meta = await sharp(storage.objects.get(key!)!).metadata();
+    assert.equal(meta.format, "webp");
+    assert.deepEqual([meta.width, meta.height, meta.hasAlpha], [64, 48, true]);
+  });
+});
+
+describe("consumer — salvage under concurrency", () => {
+  // Jobs running side by side share generated_images/: the newest file there may be another job's image.
+  function codexGeneratesInto(session: string, threadId: string | undefined): CodexRunner {
+    return async (opts) => {
+      const dir = join(opts.codexHome, "generated_images", session);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "img-001.png"), Buffer.from(`FROM-${session}`));
+      return { exitCode: 0, durationMs: 5, stderrTail: "", threadId };
+    };
+  }
+
+  test("takes the image from this job's own thread", async () => {
+    const { consumer, store, queue, storage } = build(codexGeneratesInto("thread-mine", "thread-mine"), new FakeStorage(), 2);
+    const s = spec({ assetId: "thread-1" });
+    await store.create(record("img_thread_1", s));
+    await queue.enqueue(payload("img_thread_1", s));
+    assert.equal(await runOnce(consumer, store, "img_thread_1"), "completed");
+    const key = [...storage.objects.keys()].find((k) => k.includes("/thread-1/") && k.endsWith("artifact.png"));
+    assert.equal(storage.objects.get(key!)!.toString(), "FROM-thread-mine");
+  });
+
+  test("never takes another thread's image", async () => {
+    const { consumer, store, queue } = build(codexGeneratesInto("thread-other", "thread-mine"), new FakeStorage(), 2);
+    const s = spec();
+    await store.create(record("img_thread_2", s));
+    await queue.enqueue(payload("img_thread_2", s));
+    assert.equal(await runOnce(consumer, store, "img_thread_2"), "failed");
+    assert.equal((await store.get("img_thread_2"))!.errorCode, "IMAGE_GENERATION_FAILED");
+  });
+
+  test("without a thread id, salvages nothing when jobs can run side by side", async () => {
+    const { consumer, store, queue } = build(codexGeneratesInto("some-session", undefined), new FakeStorage(), 2);
+    const s = spec();
+    await store.create(record("img_thread_3", s));
+    await queue.enqueue(payload("img_thread_3", s));
+    assert.equal(await runOnce(consumer, store, "img_thread_3"), "failed");
   });
 });

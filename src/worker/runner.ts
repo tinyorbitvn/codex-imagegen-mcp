@@ -35,8 +35,13 @@ export interface CodexRunOptions {
 export interface CodexResult {
   exitCode: number;
   durationMs: number;
-  /** Truncated stderr, ONLY for server-side logging. Never returned over MCP. */
+  /**
+   * Truncated stderr plus the error events from stdout, ONLY for
+   * server-side logging and classifyCodexFailure. Never returned over MCP.
+   */
   stderrTail: string;
+  /** Codex's thread id, which names its generated_images/<thread>/ folder. */
+  threadId?: string | undefined;
 }
 
 /**
@@ -74,7 +79,14 @@ export function buildCodexArgv(binary: string, prompt: string): string[] {
   // environment variables in the allowlist below, and still blocked by
   // NetworkPolicy from reaching anything off the approved path.
   // Verified by hand in the pod: produced a 438KB artifact.png.
-  return [binary, "exec", "--skip-git-repo-check", "--sandbox", "danger-full-access", prompt];
+  //
+  // `--ephemeral`: no session rollout on disk. Each one held the image as
+  // base64 (1.6–5 MB) and they filled the 1Gi codex home (2026-10-29).
+  // `--json`: events on stdout, the first of them carrying the thread id.
+  return [
+    binary, "exec", "--ephemeral", "--json", "--skip-git-repo-check",
+    "--sandbox", "danger-full-access", prompt,
+  ];
 }
 
 /**
@@ -253,16 +265,16 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexResult> {
 
     let stderr = "";
     let settled = false;
+    const events = new CodexEvents();
 
     child.stderr.on("data", (c: Buffer) => {
       // Keep at most the last 8KB: enough to diagnose, not enough for a
       // "chatty" Codex to blow up the worker's memory.
       stderr = (stderr + c.toString("utf8")).slice(-8192);
     });
-    // stdout is deliberately discarded: the artifact is a FILE on disk,
-    // not something Codex prints. Reading stdout would only add surface
-    // area.
-    child.stdout.resume();
+    // stdout carries only JSON events: the thread id and any error. The
+    // artifact itself is a FILE on disk, never something Codex prints.
+    child.stdout.on("data", (c: Buffer) => events.push(c.toString("utf8")));
 
     const finish = (fn: () => void) => {
       if (settled) return;
@@ -299,9 +311,48 @@ export function runCodex(opts: CodexRunOptions): Promise<CodexResult> {
         resolve({
           exitCode: code ?? -1,
           durationMs: Date.now() - started,
-          stderrTail: stderr,
+          stderrTail: (events.end() ? `${stderr}\n${events.errors}` : stderr).slice(-8192),
+          threadId: events.threadId,
         }),
       ),
     );
   });
+}
+
+/**
+ * Reads `codex exec --json` output one line at a time. Only two things
+ * are kept: the thread id, and the text of error events, because with
+ * --json a failure such as a revoked login can arrive here instead of
+ * on stderr, and classifyCodexFailure must still see it.
+ */
+class CodexEvents {
+  threadId: string | undefined;
+  errors = "";
+  #partial = "";
+
+  push(chunk: string): void {
+    const lines = (this.#partial + chunk).split("\n");
+    this.#partial = lines.pop() ?? "";
+    for (const line of lines) this.#line(line);
+  }
+
+  /** Flushes the last line; true when any error text was collected. */
+  end(): boolean {
+    this.#line(this.#partial);
+    this.#partial = "";
+    return this.errors !== "";
+  }
+
+  #line(line: string): void {
+    if (!line.trim()) return;
+    let ev: { type?: string; thread_id?: string; message?: string; error?: { message?: string } };
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (ev.type === "thread.started" && typeof ev.thread_id === "string") this.threadId = ev.thread_id;
+    const text = ev.type === "error" ? ev.message : ev.type === "turn.failed" ? ev.error?.message : undefined;
+    if (text) this.errors = `${this.errors}${text}\n`.slice(-4096);
+  }
 }

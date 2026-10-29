@@ -17,6 +17,17 @@
 import { createHash } from "node:crypto";
 import type { ImageSpec } from "../contracts/index.ts";
 
+/**
+ * Where Codex leaves its image. The worker, not Codex, turns it into the
+ * requested format: with no PIL or ImageMagick in the pod, Codex spent a
+ * median 75 s per WebP job (24 s per off-size PNG) hunting for a converter,
+ * down to `npm install sharp` into the codex home (rollouts, 2026-10-29).
+ */
+export const GENERATED_FILENAME = "generated.png";
+
+const LEAVE_CONVERSION_TO_SERVER =
+  "Do not convert, resize, crop or re-encode it, and do not install anything: the server converts it to the requested format.";
+
 /** Instructions for generating a new image. Returns ONE string, passed into argv as a single element. */
 export function buildCreatePrompt(spec: ImageSpec, outputDir: string, references: readonly string[] = []): string {
   const lines: string[] = [
@@ -78,7 +89,8 @@ export function buildCreatePrompt(spec: ImageSpec, outputDir: string, references
     "- no text unless explicitly requested",
     "",
     // Filesystem instruction: written by the worker, path supplied by the worker.
-    `Save the final generated asset to exactly this path: ${outputDir}/${spec.filename}`,
+    `Copy the generated image, unchanged, to exactly this path: ${outputDir}/${GENERATED_FILENAME}`,
+    LEAVE_CONVERSION_TO_SERVER,
     "Do not write any other file.",
     // *** WHY THIS SENTENCE NEEDS AN EXCEPTION ***
     // Codex's image-generation tool does NOT write directly into the
@@ -134,7 +146,8 @@ export function buildEditPrompt(
       ? ["- keep the background fully transparent (alpha channel), no ground shadow"]
       : []),
     "",
-    `Save the edited artifact to exactly this path: ${outputDir}/${spec.filename}`,
+    `Copy the edited image, unchanged, to exactly this path: ${outputDir}/${GENERATED_FILENAME}`,
+    LEAVE_CONVERSION_TO_SERVER,
     "Do not overwrite the source image.",
     "Do not write any other file.",
     // *** WHY THIS SENTENCE NEEDS AN EXCEPTION ***

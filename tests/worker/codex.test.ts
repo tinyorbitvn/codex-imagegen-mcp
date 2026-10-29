@@ -1,5 +1,8 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { ImageSpec } from "../../src/contracts/index.ts";
 import {
@@ -7,6 +10,7 @@ import {
   buildCodexEnv,
   classifyCodexFailure,
   retryHintFrom,
+  runCodex,
 } from "../../src/worker/runner.ts";
 import { buildCreatePrompt, buildEditPrompt, specHash } from "../../src/worker/prompt.ts";
 import { artifactKey } from "../../src/worker/consumer.ts";
@@ -35,6 +39,14 @@ describe("buildCodexArgv", () => {
     const argv = buildCodexArgv("codex", nasty);
     assert.equal(argv.at(-1), nasty);
     assert.equal(argv.filter((a) => a === nasty).length, 1);
+  });
+
+  test("runs ephemeral with JSON events, so sessions stay off the disk and the thread id is known", () => {
+    // A rollout per job (1.6–5 MB, the image inlined as base64) filled the 1Gi codex home on 2026-10-29.
+    const argv = buildCodexArgv("codex", "x");
+    assert.ok(argv.includes("--ephemeral"));
+    assert.ok(argv.includes("--json"));
+    assert.equal(argv.at(-1), "x");
   });
 
   test("never produces an element containing shell syntax", () => {
@@ -69,6 +81,44 @@ describe("buildCodexArgv", () => {
     const oneLine = buildCodexArgv("codex", "x");
     assert.equal(argv.length, oneLine.length);
     assert.equal(argv.at(-1), multiLine);
+  });
+});
+
+describe("runCodex", () => {
+  async function fakeCodex(script: string) {
+    const dir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    const bin = join(dir, "codex");
+    await writeFile(bin, `#!/bin/sh\n${script}\n`);
+    await chmod(bin, 0o755);
+    return { dir, bin };
+  }
+
+  test("reports the thread id from the JSON events", async () => {
+    const { dir, bin } = await fakeCodex(`echo '{"type":"thread.started","thread_id":"01a18700-0875-7393"}'\necho '{"type":"turn.completed"}'`);
+    try {
+      const r = await runCodex({ binary: bin, codexHome: dir, prompt: "x", cwd: dir, timeoutMs: 10_000 });
+      assert.equal(r.exitCode, 0);
+      assert.equal(r.threadId, "01a18700-0875-7393");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an error that arrives as a JSON event is still classified", async () => {
+    // With --json the failure can come on stdout instead of stderr; the classifier only sees stderrTail.
+    const { dir, bin } = await fakeCodex(
+      `echo '{"type":"thread.started","thread_id":"t1"}'\n` +
+        `echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again in 3 hours."}}'\n` +
+        `exit 1`,
+    );
+    try {
+      const r = await runCodex({ binary: bin, codexHome: dir, prompt: "x", cwd: dir, timeoutMs: 10_000 });
+      assert.equal(r.exitCode, 1);
+      assert.equal(classifyCodexFailure(r.stderrTail), "CODEX_QUOTA_EXHAUSTED");
+      assert.equal(retryHintFrom(r.stderrTail), "in 3 hours");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -205,8 +255,16 @@ describe("buildCreatePrompt", () => {
     const p = buildCreatePrompt(spec, "/work/jobs/img_abc");
     assert.match(
       p,
-      /Save the final generated asset to exactly this path: \/work\/jobs\/img_abc\/artifact\.png/,
+      /Copy the generated image, unchanged, to exactly this path: \/work\/jobs\/img_abc\/generated\.png/,
     );
+  });
+
+  test("leaves conversion to the server, whatever format was asked for", () => {
+    // Converting or resizing itself, with no PIL or ImageMagick in the pod, cost a median 75 s per WebP job.
+    const p = buildCreatePrompt({ ...spec, outputFormat: "webp", filename: "artifact.webp" }, "/d");
+    assert.match(p, /exactly this path: \/d\/generated\.png/);
+    assert.doesNotMatch(p, /artifact\.webp/);
+    assert.match(p, /Do not convert, resize, crop or re-encode it, and do not install anything/);
   });
 
   test("locks Codex's scope down, doesn't let it do anything else", () => {
@@ -261,8 +319,9 @@ describe("buildEditPrompt", () => {
     assert.match(p, /Source image file: \/work\/jobs\/img_def\/source\.png/);
     assert.match(
       p,
-      /Save the edited artifact to exactly this path: \/work\/jobs\/img_def\/artifact\.png/,
+      /Copy the edited image, unchanged, to exactly this path: \/work\/jobs\/img_def\/generated\.png/,
     );
+    assert.match(p, /Do not convert, resize, crop or re-encode it, and do not install anything/);
   });
 });
 
