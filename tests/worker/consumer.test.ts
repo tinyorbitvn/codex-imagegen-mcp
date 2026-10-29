@@ -422,7 +422,8 @@ describe("consumer — metadata must MEASURE the image, not echo the request", (
   }
 
   test("records the image's REAL dimensions, not the requested ones", async () => {
-    const { consumer, store, queue, storage } = build(codexReturning(pngThat(1254, 1254, 6)));
+    // A different shape from the canvas, so the worker leaves the size alone.
+    const { consumer, store, queue, storage } = build(codexReturning(pngThat(1254, 1536, 6)));
     const s = spec({ width: 1536, height: 1536 });
     await store.create(record("img_meta_1", s));
     await queue.enqueue(payload("img_meta_1", s));
@@ -430,11 +431,11 @@ describe("consumer — metadata must MEASURE the image, not echo the request", (
     assert.equal(await runOnce(consumer, store, "img_meta_1"), "completed");
     const art = (await store.get("img_meta_1"))!.artifact!;
     assert.equal(art.width, 1254, "must be the measurement from the file");
-    assert.equal(art.height, 1254);
+    assert.equal(art.height, 1536);
 
     const meta = [...storage.metadata.values()][0] as Record<string, unknown>;
     assert.equal(meta.width, 1254, "metadata.json must also follow the file");
-    assert.equal(meta.height, 1254);
+    assert.equal(meta.height, 1536);
   });
 
   test("an image with no alpha channel yields transparent=false, even if a transparent background was requested", async () => {
@@ -734,6 +735,49 @@ describe("consumer — the worker converts, Codex only copies", () => {
     const meta = await sharp(storage.objects.get(key!)!).metadata();
     assert.equal(meta.format, "webp");
     assert.deepEqual([meta.width, meta.height, meta.hasAlpha], [64, 48, true]);
+  });
+});
+
+describe("consumer — the worker sizes the image to the canvas", () => {
+  async function produce(image: Buffer, over: Partial<ImageSpec>, id: string) {
+    const { consumer, store, queue, storage } = build(async (opts) => {
+      await writeFile(/exactly this path: (.+)$/m.exec(opts.prompt)![1]!.trim(), image);
+      return { exitCode: 0, durationMs: 5, stderrTail: "", threadId: `t-${id}` };
+    });
+    const s = spec({ assetId: id, ...over });
+    await store.create(record(id, s));
+    await queue.enqueue(payload(id, s));
+    assert.equal(await runOnce(consumer, store, id), "completed");
+    const key = [...storage.objects.keys()].find((k) => k.includes(`/${id}/`) && k.endsWith(`/${s.filename}`));
+    return { bytes: storage.objects.get(key!)!, artifact: (await store.get(id))!.artifact! };
+  }
+  const png = (width: number, height: number) =>
+    sharp({ create: { width, height, channels: 4, background: "#3a7c" } }).png().toBuffer();
+
+  test("resizes to the exact canvas when the model only drifted in size", async () => {
+    // Measured 2026-10-29: 177 of 183 off-size images kept the canvas shape within 1%.
+    const { bytes, artifact } = await produce(await png(167, 94), { width: 160, height: 90, outputFormat: "webp", filename: "artifact.webp" }, "drift");
+    const meta = await sharp(bytes).metadata();
+    assert.deepEqual([meta.format, meta.width, meta.height, meta.hasAlpha], ["webp", 160, 90, true]);
+    assert.deepEqual([artifact.width, artifact.height], [160, 90]);
+  });
+
+  test("resizes a PNG too, not only images it converts", async () => {
+    const { bytes } = await produce(await png(167, 94), { width: 160, height: 90 }, "drift-png");
+    const meta = await sharp(bytes).metadata();
+    assert.deepEqual([meta.format, meta.width, meta.height], ["png", 160, 90]);
+  });
+
+  test("leaves the size alone when the model drew another shape", async () => {
+    // Stretching a portrait into a landscape canvas would distort it; the metadata reports the real size.
+    const { artifact } = await produce(await png(90, 160), { width: 160, height: 90 }, "portrait");
+    assert.deepEqual([artifact.width, artifact.height], [90, 160]);
+  });
+
+  test("an image already at the canvas size and format is not re-encoded", async () => {
+    const original = await png(160, 90);
+    const { bytes } = await produce(original, { width: 160, height: 90 }, "exact");
+    assert.ok(bytes.equals(original));
   });
 });
 

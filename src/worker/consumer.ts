@@ -155,26 +155,57 @@ async function firstExisting(paths: readonly string[]): Promise<string | null> {
 }
 
 /**
- * Writes `src` to `dest` in `format`. A file already in that format is
- * moved as is, so a PNG is never re-encoded; one sharp cannot read is
- * moved too, and readImageInfo then logs it.
+ * How far the image's shape may be from the canvas and still be resized to
+ * it. Measured 2026-10-29: 177 of 183 off-size images were within 1%; the
+ * other 6 were portrait for a landscape canvas, which a resize would distort.
  */
-export async function toRequestedFormat(src: string, dest: string, format: OutputFormat): Promise<void> {
-  let current: string | undefined;
+const CANVAS_ASPECT_TOLERANCE = 0.03;
+
+/**
+ * Writes `src` to `dest` in `format`, at the canvas size when only the size
+ * drifted. An image already right is moved as is, so it is never
+ * re-encoded; one sharp cannot read is moved too, and readImageInfo then
+ * logs it.
+ */
+export async function toRequestedImage(
+  src: string,
+  dest: string,
+  format: OutputFormat,
+  canvas: { width: number; height: number },
+): Promise<void> {
+  let meta: { format?: string; width?: number; height?: number } | undefined;
   try {
-    current = (await sharp(src).metadata()).format;
+    meta = await sharp(src).metadata();
   } catch {
-    current = undefined;
+    meta = undefined;
   }
-  if (current === undefined || current === format) {
+  const resize = meta?.width && meta.height ? drifted(meta.width, meta.height, canvas) : false;
+  if (meta === undefined || (meta.format === format && !resize)) {
     if (src !== dest) await rename(src, dest);
     return;
   }
+  let image = sharp(src);
+  if (resize) image = image.resize(canvas.width, canvas.height, { fit: "cover" });
   // Through a buffer: src and dest are the same file when Codex wrote the
   // final name itself, and sharp refuses to write over its own input.
-  const converted = await sharp(src).toFormat(format).toBuffer();
+  let converted: Buffer;
+  try {
+    converted = await image.toFormat(format).toBuffer();
+  } catch (err) {
+    // Only the size was off: the image as Codex made it is still a valid answer.
+    if (meta.format !== format) throw err;
+    log.warn("could not resize the image to the canvas, keeping its size", { error: String(err) });
+    if (src !== dest) await rename(src, dest);
+    return;
+  }
   await writeFile(dest, converted);
   if (src !== dest) await rm(src, { force: true });
+}
+
+/** A different size from the canvas but the same shape, within the tolerance. */
+function drifted(width: number, height: number, canvas: { width: number; height: number }): boolean {
+  if (width === canvas.width && height === canvas.height) return false;
+  return Math.abs(width / height / (canvas.width / canvas.height) - 1) <= CANVAS_ASPECT_TOLERANCE;
 }
 
 /**
@@ -454,7 +485,7 @@ export class Consumer {
         });
         produced = generated;
       }
-      await toRequestedFormat(produced, outPath, spec.outputFormat);
+      await toRequestedImage(produced, outPath, spec.outputFormat, spec);
 
       // *** MEASURE THE REAL IMAGE, DON'T ECHO THE REQUEST ***
       // The old version wrote `width: spec.width` — i.e. it re-declared

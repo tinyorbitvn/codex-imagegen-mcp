@@ -26,7 +26,7 @@ import type { ImageSpec } from "../contracts/index.ts";
 export const GENERATED_FILENAME = "generated.png";
 
 const LEAVE_CONVERSION_TO_SERVER =
-  "Do not convert, resize, crop or re-encode it, and do not install anything: the server converts it to the requested format.";
+  "Do not convert, resize, crop or re-encode it, and do not install anything: the server converts and resizes it.";
 
 /** Instructions for generating a new image. Returns ONE string, passed into argv as a single element. */
 export function buildCreatePrompt(spec: ImageSpec, outputDir: string, references: readonly string[] = []): string {
