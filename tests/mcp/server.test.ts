@@ -8,11 +8,15 @@ import express from "express";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { ANIMATION_MOTIONS, PUBLIC_TOOLS } from "../../src/contracts/index.ts";
 import { InMemoryJobQueue, InMemoryJobStore } from "../../src/queue/index.ts";
 import { ImagegenService } from "../../src/mcp/service.ts";
 import { mountMcp } from "../../src/mcp/server.ts";
+import { LocalArtifactStore } from "../../src/storage/index.ts";
 
 interface ListedTool {
   name: string;
@@ -20,14 +24,17 @@ interface ListedTool {
 }
 
 let server: Server;
+let root: string;
 let base: string;
 
 before(async () => {
   const app = express();
+  root = await mkdtemp(join(tmpdir(), "mcp-route-test-"));
   const service = new ImagegenService({
     store: new InMemoryJobStore(),
     queue: new InMemoryJobQueue(),
-    config: { rateLimit: { createImagePerHour: 0, editImagePerHour: 0 } },
+    storage: new LocalArtifactStore({ dir: root, publicBaseUrl: "http://localhost:8080" }),
+    config: { rateLimit: { createImagePerHour: 0, editImagePerHour: 0 }, uploadRetentionDays: 1 },
   });
   mountMcp(app, { service });
   server = app.listen(0);
@@ -37,6 +44,7 @@ before(async () => {
 
 after(async () => {
   await new Promise<void>((r) => server.close(() => r()));
+  await rm(root, { recursive: true, force: true });
 });
 
 async function listTools(): Promise<ListedTool[]> {

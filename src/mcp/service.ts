@@ -2,8 +2,8 @@
 //
 // *** NEARLY STATELESS ***
 // This service does NOT run Codex, does NOT hold ChatGPT credentials,
-// does NOT keep jobs in memory. It only: validates input, normalizes the
-// image spec, writes a job record, pushes work onto the queue, and then
+// does NOT keep jobs in memory. It only: validates input (including the
+// bytes of uploaded images), normalizes the image spec, writes a job record, pushes work onto the queue, and then
 // reads status back out.
 //
 // Thanks to that it can run many replicas and restart freely — all real
@@ -15,12 +15,16 @@ import {
   DEFAULT_ANIMATION_DURATION_MS,
   DEFAULT_CANVAS,
   ImagegenError,
+  MAX_UPLOAD_BYTES,
+  UPLOAD_TTL_SECONDS,
   clampAnimationDuration,
   MIME_BY_FORMAT,
   jobToResult,
+  newUploadId,
   resolveStyle,
   sanitizeFreeText,
   sanitizeIdentifier,
+  uploadKey,
 } from "../contracts/index.ts";
 import type {
   AnimationIntensity,
@@ -30,25 +34,42 @@ import type {
   ImageSpec,
   JobRecord,
   OutputFormat,
+  UploadContentType,
 } from "../contracts/index.ts";
 import type { JobQueue, JobStore } from "../queue/index.ts";
+import type { ArtifactStore } from "../storage/index.ts";
+import { decodeInlineUpload, inspectUpload } from "../uploads.ts";
+import type { UploadInfo } from "../uploads.ts";
 
 export interface ServiceConfig {
   rateLimit: {
     createImagePerHour: number;
     editImagePerHour: number;
   };
+  uploadRetentionDays: number;
 }
 
 export interface ServiceDeps {
   store: JobStore;
   queue: JobQueue;
+  storage: ArtifactStore;
   config: ServiceConfig;
 }
 
 export interface JobHandle {
   job_id: string;
   status: "queued";
+}
+
+/** What an edit or an animation starts from: a version of the asset or an upload. */
+interface StillSource {
+  key: string;
+  width: number;
+  height: number;
+  transparent: boolean;
+  format: OutputFormat;
+  /** Null for an upload: it is not a version of the asset. */
+  parentVersion: number | null;
 }
 
 /**
@@ -83,11 +104,13 @@ const WAIT_POLL_MS = 3_000;
 export class ImagegenService {
   #store: JobStore;
   #queue: JobQueue;
+  #storage: ArtifactStore;
   #cfg: ServiceConfig;
 
   constructor(deps: ServiceDeps) {
     this.#store = deps.store;
     this.#queue = deps.queue;
+    this.#storage = deps.storage;
     this.#cfg = deps.config;
   }
 
@@ -128,6 +151,11 @@ export class ImagegenService {
 
     const compIn = (raw.composition ?? {}) as Record<string, unknown>;
 
+    const referenceKeys: string[] = [];
+    for (const id of new Set((raw.reference_upload_ids as string[] | undefined) ?? [])) {
+      referenceKeys.push((await this.#upload(projectId, id)).key);
+    }
+
     const spec: ImageSpec = {
       projectId,
       assetId,
@@ -160,6 +188,7 @@ export class ImagegenService {
       parentVersion: null,
       sourceKey: null,
       instructions: null,
+      ...(referenceKeys.length > 0 ? { referenceKeys } : {}),
     });
 
     return { job_id: jobId, status: "queued" };
@@ -174,10 +203,9 @@ export class ImagegenService {
     const projectId = sanitizeIdentifier(raw.project_id, "project");
     const assetId = sanitizeIdentifier(raw.asset_id, "asset_id");
     const instructions = sanitizeFreeText(raw.instructions, "instructions");
-    const sourceVersion = raw.source_version as number | undefined;
 
-    const src = await this.#stillSource(projectId, assetId, sourceVersion);
-    const outputFormat: OutputFormat = src.mimeType === "image/webp" ? "webp" : "png";
+    const src = await this.#source(projectId, assetId, raw);
+    const outputFormat = src.format;
 
     const spec: ImageSpec = {
       projectId,
@@ -199,13 +227,13 @@ export class ImagegenService {
     const version = (await this.#store.highestAllocatedVersion(projectId, assetId)) + 1;
     const jobId = newJobId();
 
-    await this.#store.create(this.#newRecord(jobId, spec, version, src.version, principal));
+    await this.#store.create(this.#newRecord(jobId, spec, version, src.parentVersion, principal));
     await this.#queue.enqueue({
       jobId,
       kind: "edit",
       spec,
       version,
-      parentVersion: src.version,
+      parentVersion: src.parentVersion,
       sourceKey: src.key,
       instructions,
     });
@@ -226,7 +254,7 @@ export class ImagegenService {
       (raw.duration_ms as number | undefined) ?? DEFAULT_ANIMATION_DURATION_MS[motion],
     );
 
-    const src = await this.#stillSource(projectId, assetId, raw.source_version as number | undefined);
+    const src = await this.#source(projectId, assetId, raw);
 
     const spec: ImageSpec = {
       projectId,
@@ -247,19 +275,102 @@ export class ImagegenService {
     const version = (await this.#store.highestAllocatedVersion(projectId, assetId)) + 1;
     const jobId = newJobId();
 
-    await this.#store.create(this.#newRecord(jobId, spec, version, src.version, principal));
+    await this.#store.create(this.#newRecord(jobId, spec, version, src.parentVersion, principal));
     await this.#queue.enqueue({
       jobId,
       kind: "animate",
       spec,
       version,
-      parentVersion: src.version,
+      parentVersion: src.parentVersion,
       sourceKey: src.key,
       instructions: null,
       animation: { motion, intensity, durationMs },
     });
 
     return { job_id: jobId, status: "queued" };
+  }
+
+  // ---------------------------------------------------------------
+  // upload_image — the client's own image, for the other tools to use
+  // ---------------------------------------------------------------
+  async uploadImage(raw: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const projectId = sanitizeIdentifier(raw.project_id, "project");
+    const uploadId = newUploadId();
+    const key = uploadKey(projectId, uploadId);
+
+    if (raw.data_base64 !== undefined) {
+      const body = decodeInlineUpload(String(raw.data_base64));
+      const info = await inspectUpload(body);
+      await this.#storage.putObject(key, body, `image/${info.format}`);
+      return {
+        upload_id: uploadId,
+        status: "stored",
+        bytes: info.bytes,
+        width: info.width,
+        height: info.height,
+        format: info.format,
+      };
+    }
+
+    const contentType = raw.content_type as UploadContentType | undefined;
+    if (contentType === undefined) {
+      throw new ImagegenError(
+        "UNSUPPORTED_FORMAT",
+        "Pass content_type to get a POST target, or send the image inline as data_base64.",
+      );
+    }
+    const target = await this.#storage.presignUpload(key, contentType, MAX_UPLOAD_BYTES, UPLOAD_TTL_SECONDS);
+    return {
+      upload_id: uploadId,
+      status: "pending",
+      expires_at: new Date(Date.now() + UPLOAD_TTL_SECONDS * 1000).toISOString(),
+      max_bytes: MAX_UPLOAD_BYTES,
+      upload: { method: "POST", url: target.url, fields: target.fields, file_field: "file" },
+    };
+  }
+
+  /**
+   * Looks an upload up and inspects its bytes, so a missing or bad file
+   * fails the tool call instead of a queued job.
+   */
+  async #upload(projectId: string, uploadId: string): Promise<{ key: string; info: UploadInfo }> {
+    const key = uploadKey(projectId, uploadId);
+    if (!(await this.#storage.headObject(key))) {
+      throw new ImagegenError(
+        "UPLOAD_NOT_FOUND",
+        `No upload ${uploadId} in project ${projectId}: its POST has not finished, it belongs to ` +
+          `another project, or it expired (uploads are kept ${this.#cfg.uploadRetentionDays} day(s)).`,
+      );
+    }
+    return { key, info: await inspectUpload(await this.#storage.download(key)) };
+  }
+
+  async #source(projectId: string, assetId: string, raw: Record<string, unknown>): Promise<StillSource> {
+    const version = raw.source_version as number | undefined;
+    const uploadId = raw.source_upload_id as string | undefined;
+    if (uploadId !== undefined) {
+      if (version !== undefined) {
+        throw new ImagegenError("UNSUPPORTED_FORMAT", "Pass source_version or source_upload_id, not both.");
+      }
+      const { key, info } = await this.#upload(projectId, uploadId);
+      return {
+        key,
+        width: info.width,
+        height: info.height,
+        transparent: info.hasAlpha,
+        format: info.format === "webp" ? "webp" : "png",
+        parentVersion: null,
+      };
+    }
+    const src = await this.#stillSource(projectId, assetId, version);
+    return {
+      key: src.key,
+      width: src.width,
+      height: src.height,
+      transparent: src.transparent,
+      format: src.mimeType === "image/webp" ? "webp" : "png",
+      parentVersion: src.version,
+    };
   }
 
   /**

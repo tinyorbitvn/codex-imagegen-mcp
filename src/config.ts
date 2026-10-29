@@ -62,6 +62,7 @@ export interface Config {
   storage:
     | { kind: "s3"; s3: StorageConfig }
     | { kind: "local"; dir: string; publicBaseUrl: string };
+  uploads: { corsOrigins: string[]; retentionDays: number };
   mcp: {
     rateLimit: { createImagePerHour: number; editImagePerHour: number };
   };
@@ -147,6 +148,16 @@ export function loadConfig(): Config {
     otlpEndpoint: str("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
     queue: { kind: queueKind, url: redisUrl, limit: int("QUEUE_LIMIT", 64) },
     storage,
+    uploads: {
+      // The signed POST policy is the credential; CORS only decides which
+      // pages may send it, so any origin is the default.
+      corsOrigins: str("UPLOAD_CORS_ORIGINS", "*")
+        .split(",")
+        .map((o) => o.trim())
+        .filter(Boolean),
+      // A bucket lifecycle rule counts whole days, one at least.
+      retentionDays: Math.max(1, int("UPLOAD_RETENTION_DAYS", 1)),
+    },
     mcp: {
       rateLimit: {
         createImagePerHour: int("RATE_LIMIT_CREATE_IMAGE_PER_HOUR", 10),

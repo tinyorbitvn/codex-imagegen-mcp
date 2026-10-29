@@ -4,20 +4,41 @@
 // locks down the MCP contract first; wiring in the real Codex-backed
 // worker comes later.
 
-import { test, describe } from "node:test";
+import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import sharp from "sharp";
 
-import { ImagegenError } from "../../src/contracts/index.ts";
+import { ImagegenError, MAX_UPLOAD_BYTES, newUploadId, uploadKey } from "../../src/contracts/index.ts";
 import type { ArtifactRef, JobPayload } from "../../src/contracts/index.ts";
 import { InMemoryJobQueue, InMemoryJobStore } from "../../src/queue/index.ts";
+import { LocalArtifactStore } from "../../src/storage/index.ts";
+import type { ArtifactStore, PresignedUpload } from "../../src/storage/index.ts";
 
 import { ImagegenService } from "../../src/mcp/service.ts";
 
-function build(limits = { createImagePerHour: 100, editImagePerHour: 100 }) {
+const storageRoot = mkdtempSync(join(tmpdir(), "service-uploads-"));
+after(() => rmSync(storageRoot, { recursive: true, force: true }));
+
+function localStore(): LocalArtifactStore {
+  return new LocalArtifactStore({ dir: storageRoot, publicBaseUrl: "http://localhost:8080" });
+}
+
+function build(
+  limits = { createImagePerHour: 100, editImagePerHour: 100 },
+  storage: ArtifactStore = localStore(),
+) {
   const store = new InMemoryJobStore();
   const queue = new InMemoryJobQueue();
-  const service = new ImagegenService({ store, queue, config: { rateLimit: limits } });
-  return { service, store, queue };
+  const service = new ImagegenService({
+    store,
+    queue,
+    storage,
+    config: { rateLimit: limits, uploadRetentionDays: 1 },
+  });
+  return { service, store, queue, storage };
 }
 
 /** Simulates a worker completing a job it ALREADY DEQUEUED. */
@@ -153,7 +174,8 @@ describe("create_image", () => {
     const service = new ImagegenService({
       store,
       queue,
-      config: { rateLimit: { createImagePerHour: 100, editImagePerHour: 100 } },
+      storage: localStore(),
+      config: { rateLimit: { createImagePerHour: 100, editImagePerHour: 100 }, uploadRetentionDays: 1 },
     });
     for (const id of ["a1", "a2"]) {
       await service.createImage(
@@ -458,5 +480,165 @@ describe("animate_image", () => {
       () => service.animateImage({ project_id: "p", asset_id: "missing", motion: "spin" }, "x"),
       (e: unknown) => e instanceof ImagegenError && e.code === "JOB_NOT_FOUND",
     );
+  });
+});
+
+const pngBytes = (w = 32, h = 32) =>
+  sharp({ create: { width: w, height: h, channels: 4, background: { r: 10, g: 20, b: 30, alpha: 1 } } })
+    .png()
+    .toBuffer();
+const jpegBytes = (w = 40, h = 30) =>
+  sharp({ create: { width: w, height: h, channels: 3, background: { r: 10, g: 20, b: 30 } } })
+    .jpeg()
+    .toBuffer();
+
+async function uploadInline(service: ImagegenService, projectId: string, buf: Buffer): Promise<string> {
+  const r = await service.uploadImage({ project_id: projectId, data_base64: buf.toString("base64") });
+  return r.upload_id as string;
+}
+
+const code = (c: string) => (e: unknown) => e instanceof ImagegenError && e.code === c;
+
+class PresigningStore extends LocalArtifactStore {
+  calls: Array<{ key: string; contentType: string; maxBytes: number; ttlSeconds: number }> = [];
+  override async presignUpload(
+    key: string,
+    contentType: string,
+    maxBytes: number,
+    ttlSeconds: number,
+  ): Promise<PresignedUpload> {
+    this.calls.push({ key, contentType, maxBytes, ttlSeconds });
+    return { url: "https://s3.example/mcp-artifacts", fields: { key, "Content-Type": contentType } };
+  }
+}
+
+describe("upload_image", () => {
+  test("inline data is inspected and stored under the project", async () => {
+    const { service, storage } = build();
+    const r = await service.uploadImage({ project_id: "p", data_base64: (await pngBytes(32, 24)).toString("base64") });
+    assert.equal(r.status, "stored");
+    assert.equal(r.width, 32);
+    assert.equal(r.height, 24);
+    assert.equal(r.format, "png");
+    assert.ok(await storage.headObject(uploadKey("p", r.upload_id as string)));
+  });
+
+  test("inline data that is not an image is refused and nothing is stored", async () => {
+    const { service } = build();
+    await assert.rejects(
+      service.uploadImage({ project_id: "p", data_base64: Buffer.from("hello").toString("base64") }),
+      code("UNSUPPORTED_FORMAT"),
+    );
+  });
+
+  test("without data the POST target comes from the store, capped and short-lived", async () => {
+    const storage = new PresigningStore({ dir: storageRoot, publicBaseUrl: "http://localhost:8080" });
+    const { service } = build(undefined, storage);
+    const r = await service.uploadImage({ project_id: "p", content_type: "image/jpeg" });
+    const upload = r.upload as { method: string; url: string; fields: Record<string, string>; file_field: string };
+    assert.equal(r.status, "pending");
+    assert.equal(r.max_bytes, MAX_UPLOAD_BYTES);
+    assert.equal(upload.method, "POST");
+    assert.equal(upload.url, "https://s3.example/mcp-artifacts");
+    assert.equal(upload.file_field, "file");
+    assert.equal(upload.fields.key, uploadKey("p", r.upload_id as string));
+    assert.deepEqual(storage.calls[0], {
+      key: uploadKey("p", r.upload_id as string),
+      contentType: "image/jpeg",
+      maxBytes: MAX_UPLOAD_BYTES,
+      ttlSeconds: 900,
+    });
+    const left = Date.parse(r.expires_at as string) - Date.now();
+    assert.ok(left > 890_000 && left <= 900_000);
+  });
+
+  test("with neither data nor content_type it says what to send", async () => {
+    const { service } = build();
+    await assert.rejects(service.uploadImage({ project_id: "p" }), code("UNSUPPORTED_FORMAT"));
+  });
+
+  test("on local storage a POST target is refused in favour of inline data", async () => {
+    const { service } = build();
+    await assert.rejects(
+      service.uploadImage({ project_id: "p", content_type: "image/png" }),
+      (e: unknown) => code("UNSUPPORTED_FORMAT")(e) && /data_base64/.test((e as Error).message),
+    );
+  });
+});
+
+describe("using an upload", () => {
+  const create = (projectId: string, refs: string[]) => ({
+    project_id: projectId, asset_id: "hero", description: "a cloud", reference_upload_ids: refs,
+  });
+
+  test("create_image carries each reference once, in order", async () => {
+    const { service, queue } = build();
+    const a = await uploadInline(service, "p", await pngBytes());
+    const b = await uploadInline(service, "p", await jpegBytes());
+    await service.createImage(create("p", [a, b, a]), "u");
+    const p = (await queue.dequeue(1000))!;
+    assert.deepEqual(p.referenceKeys, [uploadKey("p", a), uploadKey("p", b)]);
+  });
+
+  test("a create without references keeps the payload as before", async () => {
+    const { service, queue } = build();
+    await service.createImage({ project_id: "p", asset_id: "hero", description: "x" }, "u");
+    assert.equal("referenceKeys" in (await queue.dequeue(1000))!, false);
+  });
+
+  test("an unknown, malformed or other-project upload is UPLOAD_NOT_FOUND and nothing is queued", async () => {
+    const { service, queue } = build();
+    const elsewhere = await uploadInline(service, "p1", await pngBytes());
+    for (const id of [newUploadId(), "../etc/passwd", elsewhere]) {
+      await assert.rejects(service.createImage(create("p2", [id]), "u"), code("UPLOAD_NOT_FOUND"), id);
+    }
+    assert.equal(await queue.depth(), 0);
+  });
+
+  test("an upload whose bytes are not an image is refused at submit", async () => {
+    const { service, storage } = build();
+    const id = newUploadId();
+    await storage.putObject(uploadKey("p", id), Buffer.from("junk"), "image/png");
+    await assert.rejects(service.createImage(create("p", [id]), "u"), code("UNSUPPORTED_FORMAT"));
+  });
+
+  test("edit_image from an upload starts the asset at v1 with no parent", async () => {
+    const { service, queue, store } = build();
+    const id = await uploadInline(service, "p", await jpegBytes(40, 30));
+    const h = await service.editImage(
+      { project_id: "p", asset_id: "logo", source_upload_id: id, instructions: "make it blue" },
+      "u",
+    );
+    const p = (await queue.dequeue(1000))!;
+    assert.equal(p.kind, "edit");
+    assert.equal(p.version, 1);
+    assert.equal(p.parentVersion, null);
+    assert.equal(p.sourceKey, uploadKey("p", id));
+    assert.equal(p.spec.width, 40);
+    assert.equal(p.spec.height, 30);
+    assert.equal(p.spec.outputFormat, "png", "a JPEG source is edited into PNG");
+    assert.equal(p.spec.transparentBackground, false, "no alpha in the upload");
+    assert.equal((await store.get(h.job_id))!.parentVersion, null);
+  });
+
+  test("source_upload_id and source_version together are refused", async () => {
+    const { service } = build();
+    const id = await uploadInline(service, "p", await pngBytes());
+    await assert.rejects(
+      service.editImage({ project_id: "p", asset_id: "a", source_upload_id: id, source_version: 1, instructions: "x" }, "u"),
+      code("UNSUPPORTED_FORMAT"),
+    );
+  });
+
+  test("animate_image from an upload points the worker at the upload", async () => {
+    const { service, queue } = build();
+    const id = await uploadInline(service, "p", await pngBytes(48, 32));
+    await service.animateImage({ project_id: "p", asset_id: "badge", source_upload_id: id, motion: "pulse" }, "u");
+    const p = (await queue.dequeue(1000))!;
+    assert.equal(p.kind, "animate");
+    assert.equal(p.parentVersion, null);
+    assert.equal(p.sourceKey, uploadKey("p", id));
+    assert.equal(p.spec.width, 48);
+    assert.equal(p.spec.transparentBackground, true);
   });
 });

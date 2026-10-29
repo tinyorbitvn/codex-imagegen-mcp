@@ -19,6 +19,7 @@ const READ_BY_LOADER = [
   "WORK_DIR", "CODEX_HOME", "CODEX_BINARY", "JOB_TIMEOUT_SECONDS",
   "WORKER_CONCURRENCY", "GENERATED_IMAGE_RETENTION_HOURS",
   "RATE_LIMIT_CREATE_IMAGE_PER_HOUR", "RATE_LIMIT_EDIT_IMAGE_PER_HOUR",
+  "UPLOAD_CORS_ORIGINS", "UPLOAD_RETENTION_DAYS",
 ];
 
 // Every test writes to process.env, which is process-wide and shared with
@@ -153,5 +154,23 @@ describe("loadConfig defaults", () => {
     assert.equal(cfg.queue.limit, 64);
     assert.equal(cfg.mcp.rateLimit.createImagePerHour, 10);
     assert.equal(cfg.mcp.rateLimit.editImagePerHour, 20);
+  });
+});
+
+describe("loadConfig uploads", () => {
+  test("defaults to any origin and one day", () => {
+    assert.deepEqual(loadConfig().uploads, { corsOrigins: ["*"], retentionDays: 1 });
+  });
+
+  test("a comma list of origins is split and trimmed", () => {
+    process.env.UPLOAD_CORS_ORIGINS = "https://a.example, https://b.example ,";
+    assert.deepEqual(loadConfig().uploads.corsOrigins, ["https://a.example", "https://b.example"]);
+  });
+
+  test("retention never drops below the one day a bucket lifecycle can express", () => {
+    process.env.UPLOAD_RETENTION_DAYS = "0";
+    assert.equal(loadConfig().uploads.retentionDays, 1);
+    process.env.UPLOAD_RETENTION_DAYS = "7";
+    assert.equal(loadConfig().uploads.retentionDays, 7);
   });
 });

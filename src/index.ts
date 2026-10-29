@@ -85,12 +85,18 @@ if (servesMcp) {
   const service = new ImagegenService({
     store,
     queue,
-    config: { rateLimit: config.mcp.rateLimit },
+    storage,
+    config: { rateLimit: config.mcp.rateLimit, uploadRetentionDays: config.uploads.retentionDays },
   });
   mountMcp(app, { service });
   // Only the MCP roles serve images: the worker has no route in front of
   // it and clients are never handed its address.
   if (config.storage.kind === "local") mountArtifacts(app, config.storage.dir);
+  // Not awaited: uploads are a side door, and a bucket that refuses CORS
+  // or lifecycle must not keep the MCP endpoint from starting.
+  void storage
+    .configureUploads(config.uploads)
+    .catch((e: unknown) => log.warn("could not configure the bucket for uploads", { error: (e as Error).message }));
 }
 
 let worker: RunningWorker | null = null;
