@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import type { ImageSpec } from "../contracts/index.ts";
 
 /** Instructions for generating a new image. Returns ONE string, passed into argv as a single element. */
-export function buildCreatePrompt(spec: ImageSpec, outputDir: string): string {
+export function buildCreatePrompt(spec: ImageSpec, outputDir: string, references: readonly string[] = []): string {
   const lines: string[] = [
     "Generate exactly one image artifact according to this specification.",
     "",
@@ -36,6 +36,16 @@ export function buildCreatePrompt(spec: ImageSpec, outputDir: string): string {
 
   if (spec.stylePrompt) {
     lines.push("", "Style:", spec.stylePrompt);
+  }
+
+  if (references.length > 0) {
+    lines.push(
+      "",
+      "Reference images (already in the working directory; look at them before drawing):",
+      ...references.map((r) => `${outputDir}/${r}`),
+      "Use them as visual reference for the subject and style. Do not copy text, logos or " +
+        "watermarks from them unless the description asks for it.",
+    );
   }
 
   lines.push(

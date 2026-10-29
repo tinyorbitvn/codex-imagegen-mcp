@@ -629,3 +629,89 @@ describe("consumer — animate_image", () => {
     assert.equal(storage.objects.has("projects/tinyorbit-cloud/bell/v2/animation.webp"), false);
   });
 });
+
+describe("consumer — uploads", () => {
+  const UP1 = "uploads/tinyorbit-cloud/upl_" + "1".repeat(32);
+  const UP2 = "uploads/tinyorbit-cloud/upl_" + "2".repeat(32);
+
+  function jpeg(w: number, h: number, orientation?: number): Promise<Buffer> {
+    const s = sharp({ create: { width: w, height: h, channels: 3, background: { r: 200, g: 40, b: 40 } } }).jpeg();
+    return (orientation ? s.withMetadata({ orientation }) : s).toBuffer();
+  }
+
+  test("references land as reference-N.png and the prompt names them", async () => {
+    const seen: { prompt?: string; files?: string[]; cwd?: string; format?: string } = {};
+    const runner: CodexRunner = async (opts) => {
+      seen.prompt = opts.prompt;
+      seen.cwd = opts.cwd;
+      seen.files = await readdir(opts.cwd);
+      seen.format = (await sharp(join(opts.cwd, "reference-1.png")).metadata()).format;
+      return codexOk(opts);
+    };
+    const { consumer, store, queue, storage } = build(runner);
+    storage.objects.set(UP1, await jpeg(40, 30));
+    storage.objects.set(UP2, await jpeg(30, 40));
+    const p: JobPayload = { ...payload("img_refs", spec()), referenceKeys: [UP1, UP2] };
+    await store.create(record(p.jobId, p.spec));
+    await queue.enqueue(p);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "completed");
+    assert.ok(seen.files!.includes("reference-1.png") && seen.files!.includes("reference-2.png"));
+    assert.ok(seen.prompt!.includes(`${seen.cwd}/reference-1.png`));
+    assert.ok(seen.prompt!.includes(`${seen.cwd}/reference-2.png`));
+    assert.match(seen.prompt!, /Do not copy text, logos or watermarks/);
+    assert.equal(seen.format, "png");
+  });
+
+  test("an uploaded edit source is turned upright and stripped before Codex sees it", async () => {
+    const seen: { width?: number; height?: number; orientation?: number; format?: string } = {};
+    const runner: CodexRunner = async (opts) => {
+      const m = await sharp(join(opts.cwd, "source.png")).metadata();
+      Object.assign(seen, { width: m.width, height: m.height, orientation: m.orientation, format: m.format });
+      return codexOk(opts);
+    };
+    const { consumer, store, queue, storage } = build(runner);
+    storage.objects.set(UP1, await jpeg(40, 20, 6));
+    const p: JobPayload = {
+      jobId: "img_upedit", kind: "edit", spec: spec({ width: 20, height: 40 }), version: 1,
+      parentVersion: null, sourceKey: UP1, instructions: "make it blue",
+    };
+    await store.create(record(p.jobId, p.spec));
+    await queue.enqueue(p);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "completed");
+    assert.deepEqual(seen, { width: 20, height: 40, orientation: undefined, format: "png" });
+  });
+
+  test("animate_image renders an upright animation from an upload", async () => {
+    const { consumer, store, queue, storage } = build(async () => {
+      throw new Error("Codex must not run for animate_image");
+    });
+    storage.objects.set(UP1, await jpeg(40, 20, 6));
+    const p: JobPayload = {
+      jobId: "img_upanim", kind: "animate",
+      spec: spec({ assetId: "logo", outputFormat: "webp", filename: "animation.webp", width: 20, height: 40 }),
+      version: 1, parentVersion: null, sourceKey: UP1, instructions: null,
+      animation: { motion: "pulse", intensity: "low", durationMs: 400 },
+    };
+    await store.create(record(p.jobId, p.spec));
+    await queue.enqueue(p);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "completed");
+    const a = (await store.get(p.jobId))!.artifact!;
+    assert.equal(a.parentVersion, null);
+    assert.ok(a.height > a.width, `upright portrait canvas, got ${a.width}x${a.height}`);
+  });
+
+  test("an upload that expired before the job ran fails as UPLOAD_NOT_FOUND", async () => {
+    const { consumer, store, queue } = build(codexOk);
+    const p: JobPayload = { ...payload("img_refgone", spec()), referenceKeys: [UP1] };
+    await store.create(record(p.jobId, p.spec));
+    await queue.enqueue(p);
+
+    assert.equal(await runOnce(consumer, store, p.jobId), "failed");
+    const job = (await store.get(p.jobId))!;
+    assert.equal(job.errorCode, "UPLOAD_NOT_FOUND");
+    assert.match(job.errorMessage ?? "", /upload it again/);
+  });
+});

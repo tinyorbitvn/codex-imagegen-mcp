@@ -8,10 +8,11 @@ import { join } from "node:path";
 import {
   ImagegenError,
   MIME_BY_FORMAT,
+  isUploadKey,
   log,
   toImagegenError,
 } from "../contracts/index.ts";
-import type { ArtifactRef, JobPayload } from "../contracts/index.ts";
+import type { ArtifactRef, JobPayload, OutputFormat } from "../contracts/index.ts";
 import type { JobQueue, JobStore } from "../queue/index.ts";
 import type { ArtifactStore } from "../storage/index.ts";
 
@@ -21,6 +22,7 @@ import type { CodexResult } from "./runner.ts";
 import { metrics } from "./metrics.ts";
 import { readImageInfo } from "./imagesize.ts";
 import { renderAnimation } from "./animate.ts";
+import { normaliseUpload } from "../uploads.ts";
 
 /** Lets tests swap the real Codex for a fake function. */
 export type CodexRunner = (opts: {
@@ -296,11 +298,12 @@ export class Consumer {
       let prompt: string;
       if (payload.kind === "edit") {
         const sourceFilename = `source.${spec.outputFormat}`;
-        const buf = await this.#storage.download(payload.sourceKey!);
+        const buf = await this.#input(payload.sourceKey!, spec.outputFormat);
         await writeFile(join(jobDir, sourceFilename), buf, { mode: 0o600 });
         prompt = buildEditPrompt(spec, payload.instructions ?? "", sourceFilename, jobDir);
       } else {
-        prompt = buildCreatePrompt(spec, jobDir);
+        const references = await this.#writeReferences(payload.referenceKeys ?? [], jobDir);
+        prompt = buildCreatePrompt(spec, jobDir, references);
       }
 
       // Watch the cancel flag while Codex is running: without this loop,
@@ -497,17 +500,44 @@ export class Consumer {
   }
 
   /**
-   * Renders an animate_image job from a still the worker made earlier.
-   * The service has already refused animated sources, so the source is a
-   * single frame.
+   * Renders an animate_image job from a still: an earlier artifact or an
+   * upload. The service has already refused animated sources, so the
+   * source is a single frame.
    */
+  /**
+   * A job's input image. Uploads come from clients, so they are turned
+   * upright and stripped of metadata; artifacts are the worker's own
+   * output and are used as stored.
+   */
+  async #input(key: string, format: OutputFormat): Promise<Buffer> {
+    if (!isUploadKey(key)) return this.#storage.download(key);
+    let buf: Buffer;
+    try {
+      buf = await this.#storage.download(key);
+    } catch {
+      // A long queue can outlive the upload's retention window.
+      throw new ImagegenError("UPLOAD_NOT_FOUND", "The uploaded image expired before the job ran; upload it again.");
+    }
+    return normaliseUpload(buf, format);
+  }
+
+  async #writeReferences(keys: readonly string[], jobDir: string): Promise<string[]> {
+    const names: string[] = [];
+    for (const [i, key] of keys.entries()) {
+      const name = `reference-${i + 1}.png`;
+      await writeFile(join(jobDir, name), await this.#input(key, "png"), { mode: 0o600 });
+      names.push(name);
+    }
+    return names;
+  }
+
   async #animate(
     payload: JobPayload,
     jobDir: string,
   ): Promise<{ artifact: ArtifactRef; uploadMs: number }> {
     const { spec, version } = payload;
     const request = payload.animation!;
-    const source = await this.#storage.download(payload.sourceKey!);
+    const source = await this.#input(payload.sourceKey!, "png");
     const out = await renderAnimation(source, request);
     // The render is the long part, so this is where a cancel_image_job
     // sent mid-job is honoured: nothing gets uploaded.
