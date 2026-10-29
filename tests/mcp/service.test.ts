@@ -630,9 +630,23 @@ describe("using an upload", () => {
     );
   });
 
+  test("an opaque PNG that merely has an alpha channel is not edited as transparent", async () => {
+    // Browser canvas exports and screenshots are RGBA with every pixel opaque.
+    const { service, queue } = build();
+    const id = await uploadInline(service, "p", await pngBytes(40, 30));
+    await service.editImage({ project_id: "p", asset_id: "shot", source_upload_id: id, instructions: "x" }, "u");
+    assert.equal((await queue.dequeue(1000))!.spec.transparentBackground, false);
+  });
+
   test("animate_image from an upload points the worker at the upload", async () => {
     const { service, queue } = build();
-    const id = await uploadInline(service, "p", await pngBytes(48, 32));
+    const cutout = await sharp({
+      create: { width: 48, height: 32, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    })
+      .composite([{ input: await pngBytes(16, 16), left: 16, top: 8 }])
+      .png()
+      .toBuffer();
+    const id = await uploadInline(service, "p", cutout);
     await service.animateImage({ project_id: "p", asset_id: "badge", source_upload_id: id, motion: "pulse" }, "u");
     const p = (await queue.dequeue(1000))!;
     assert.equal(p.kind, "animate");

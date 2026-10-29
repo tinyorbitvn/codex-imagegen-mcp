@@ -38,7 +38,7 @@ import type {
 } from "../contracts/index.ts";
 import type { JobQueue, JobStore } from "../queue/index.ts";
 import type { ArtifactStore } from "../storage/index.ts";
-import { decodeInlineUpload, inspectUpload } from "../uploads.ts";
+import { decodeInlineUpload, hasTransparentPixels, inspectUpload } from "../uploads.ts";
 import type { UploadInfo } from "../uploads.ts";
 
 export interface ServiceConfig {
@@ -333,7 +333,7 @@ export class ImagegenService {
    * Looks an upload up and inspects its bytes, so a missing or bad file
    * fails the tool call instead of a queued job.
    */
-  async #upload(projectId: string, uploadId: string): Promise<{ key: string; info: UploadInfo }> {
+  async #upload(projectId: string, uploadId: string): Promise<{ key: string; info: UploadInfo; body: Buffer }> {
     const key = uploadKey(projectId, uploadId);
     if (!(await this.#storage.headObject(key))) {
       throw new ImagegenError(
@@ -342,7 +342,8 @@ export class ImagegenService {
           `another project, or it expired (uploads are kept ${this.#cfg.uploadRetentionDays} day(s)).`,
       );
     }
-    return { key, info: await inspectUpload(await this.#storage.download(key)) };
+    const body = await this.#storage.download(key);
+    return { key, info: await inspectUpload(body), body };
   }
 
   async #source(projectId: string, assetId: string, raw: Record<string, unknown>): Promise<StillSource> {
@@ -352,12 +353,12 @@ export class ImagegenService {
       if (version !== undefined) {
         throw new ImagegenError("UNSUPPORTED_FORMAT", "Pass source_version or source_upload_id, not both.");
       }
-      const { key, info } = await this.#upload(projectId, uploadId);
+      const { key, info, body } = await this.#upload(projectId, uploadId);
       return {
         key,
         width: info.width,
         height: info.height,
-        transparent: info.hasAlpha,
+        transparent: await hasTransparentPixels(body, info),
         format: info.format === "webp" ? "webp" : "png",
         parentVersion: null,
       };

@@ -84,6 +84,16 @@ export async function normaliseUpload(buf: Buffer, format: "png" | "webp"): Prom
     .toBuffer();
 }
 
+/**
+ * Whether any pixel is see-through. An alpha channel alone does not say so:
+ * browser canvas exports and screenshots are RGBA with every pixel opaque.
+ */
+export async function hasTransparentPixels(buf: Buffer, info: UploadInfo): Promise<boolean> {
+  if (!info.hasAlpha) return false;
+  const { isOpaque } = await sharp(buf, { limitInputPixels: MAX_UPLOAD_SIDE * MAX_UPLOAD_SIDE }).stats();
+  return !isOpaque;
+}
+
 export function decodeInlineUpload(data: string): Buffer {
   const raw = data.trim().replace(DATA_URI, "").replace(/\s+/g, "");
   if (!BASE64.test(raw)) refuse("is not valid base64.");
