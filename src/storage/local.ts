@@ -13,10 +13,10 @@
 // process, so a worker in another pod cannot write into the directory the
 // MCP process serves. loadConfig() refuses that combination outright.
 
-import { copyFile, mkdir, readFile, writeFile, access, constants } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile, access, constants, stat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { ImagegenError } from "../contracts/index.ts";
-import type { ArtifactStore, UploadResult } from "./types.ts";
+import type { ArtifactStore, PresignedUpload, UploadBucketSettings, UploadResult } from "./types.ts";
 
 export interface LocalStorageConfig {
   dir: string;
@@ -176,5 +176,38 @@ export class LocalArtifactStore implements ArtifactStore {
    */
   async signedUrl(key: string): Promise<string> {
     return this.publicUrl(key);
+  }
+
+  async putObject(key: string, body: Buffer, contentType: string): Promise<void> {
+    void contentType;
+    const target = this.#pathFor(key);
+    try {
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, body);
+    } catch {
+      throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Failed to write the upload to the artifact directory");
+    }
+  }
+
+  async headObject(key: string): Promise<{ bytes: number } | null> {
+    try {
+      const st = await stat(this.#pathFor(key));
+      return st.isFile() ? { bytes: st.size } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async presignUpload(key: string, contentType: string, maxBytes: number, ttlSeconds: number): Promise<PresignedUpload> {
+    void key, contentType, maxBytes, ttlSeconds;
+    throw new ImagegenError(
+      "UNSUPPORTED_FORMAT",
+      "Uploading by POST needs S3 storage; send the image inline as data_base64 instead.",
+    );
+  }
+
+  /** Nothing to configure: uploads on disk are never served and are not expired. */
+  async configureUploads(settings: UploadBucketSettings): Promise<void> {
+    void settings;
   }
 }

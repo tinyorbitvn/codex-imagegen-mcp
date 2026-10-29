@@ -52,6 +52,13 @@ export function mountArtifacts(app: express.Express, dir: string): void {
       if (!res.headersSent) res.status(404).json({ error: "artifact not found" });
     };
 
+    // Uploads share this directory but stay private, as on S3, where the
+    // bucket policy only makes projects/* public.
+    if (!key.startsWith("projects/")) {
+      notFound();
+      return;
+    }
+
     const full = resolve(root, key);
     if (key === "" || (full !== root && !full.startsWith(root + sep))) {
       log.warn("rejected an artifact path that escapes the artifact directory");

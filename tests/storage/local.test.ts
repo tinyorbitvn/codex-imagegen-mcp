@@ -117,4 +117,22 @@ describe("LocalArtifactStore", () => {
     const s = new LocalArtifactStore({ dir: fresh, publicBaseUrl: "http://localhost:8080" });
     assert.equal(await s.isReachable(), true);
   });
+
+  test("putObject stores bytes that headObject then sizes", async () => {
+    const key = "uploads/p/upl_" + "a".repeat(32);
+    await store.putObject(key, Buffer.from("12345"), "image/png");
+    assert.deepEqual(await store.headObject(key), { bytes: 5 });
+    assert.deepEqual(await store.download(key), Buffer.from("12345"));
+  });
+
+  test("headObject reports a missing object as null", async () => {
+    assert.equal(await store.headObject("uploads/p/upl_" + "b".repeat(32)), null);
+  });
+
+  test("a presigned POST needs S3, and the error says to send inline data", async () => {
+    await assert.rejects(
+      store.presignUpload("uploads/p/upl_" + "c".repeat(32), "image/png", 1000, 900),
+      (e: unknown) => e instanceof ImagegenError && e.code === "UNSUPPORTED_FORMAT" && /data_base64/.test(e.message),
+    );
+  });
 });

@@ -15,6 +15,17 @@ export interface UploadResult {
   durationMs: number;
 }
 
+/** A browser-style POST target: send `fields` first, then the file. */
+export interface PresignedUpload {
+  url: string;
+  fields: Record<string, string>;
+}
+
+export interface UploadBucketSettings {
+  corsOrigins: string[];
+  retentionDays: number;
+}
+
 export interface ArtifactStore {
   /** Whether the store can be written to right now — used for the readiness probe. */
   isReachable(): Promise<boolean>;
@@ -25,4 +36,12 @@ export interface ArtifactStore {
   /** The URL handed to the MCP client. */
   publicUrl(key: string): string;
   signedUrl(key: string): Promise<string>;
+  /** Stores bytes already in memory: inline uploads. */
+  putObject(key: string, body: Buffer, contentType: string): Promise<void>;
+  /** Size of an object, or null when there is none. */
+  headObject(key: string): Promise<{ bytes: number } | null>;
+  /** A POST target for exactly one key, capped at maxBytes. S3 only. */
+  presignUpload(key: string, contentType: string, maxBytes: number, ttlSeconds: number): Promise<PresignedUpload>;
+  /** CORS for the POST target and expiry of uploads/. A no-op where neither applies. */
+  configureUploads(settings: UploadBucketSettings): Promise<void>;
 }

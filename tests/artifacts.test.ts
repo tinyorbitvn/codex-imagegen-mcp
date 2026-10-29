@@ -34,6 +34,8 @@ before(async () => {
   // A file OUTSIDE the artifact directory, standing in for anything on the
   // filesystem a traversal could reach.
   await writeFile(join(root, "..", "artifact-route-secret.txt"), "top secret");
+  await mkdir(join(root, "uploads/tinyorbit-cloud"), { recursive: true });
+  await writeFile(join(root, "uploads/tinyorbit-cloud/upl_" + "e".repeat(32)), "a client's photo");
 
   const app = express();
   mountArtifacts(app, root);
@@ -76,6 +78,11 @@ describe("GET /artifacts", () => {
 
   test("a missing artifact is a 404", async () => {
     const res = await fetch(`${base}/artifacts/projects/tinyorbit-cloud/hero/v9/artifact.png`);
+    assert.equal(res.status, 404);
+  });
+
+  test("uploads are private, as on S3 where only projects/ is public", async () => {
+    const res = await fetch(`${base}/artifacts/uploads/tinyorbit-cloud/upl_${"e".repeat(32)}`);
     assert.equal(res.status, 404);
   });
 
