@@ -61,11 +61,18 @@ the key, a plain unsigned GET, so that bucket has to allow anonymous download.
 |---|---|---|
 | `RATE_LIMIT_CREATE_IMAGE_PER_HOUR` | `10` | Per caller. `0` turns the limit off. |
 | `RATE_LIMIT_EDIT_IMAGE_PER_HOUR` | `20` | Per caller. `0` turns the limit off. |
+| `UPLOAD_CORS_ORIGINS` | `*` | Comma-separated origins allowed to POST an upload from a browser. The signed POST policy is the credential; this only limits which pages may send it. |
+| `UPLOAD_RETENTION_DAYS` | `1` | Days before the bucket deletes `uploads/`. Applied as a lifecycle rule at startup; at least 1. |
 
 The caller identity is taken from the first header present out of
 `x-agentgateway-principal`, `x-jwt-sub`, `x-user`, and is `anonymous`
 otherwise. With no authenticating proxy in front, every caller shares the
 `anonymous` bucket.
+
+With S3 storage the MCP role needs the bucket credentials too: it presigns
+upload targets, writes inline uploads and inspects every upload before a job
+is queued. At startup it sets the bucket's CORS and lifecycle rules,
+replacing any that were there.
 
 ## What is deliberately absent
 

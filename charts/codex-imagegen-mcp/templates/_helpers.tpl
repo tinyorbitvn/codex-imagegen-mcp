@@ -146,6 +146,10 @@ Deployments cannot drift apart: there is one definition of every variable.
   value: {{ $.Values.rateLimit.createImagePerHour | quote }}
 - name: RATE_LIMIT_EDIT_IMAGE_PER_HOUR
   value: {{ $.Values.rateLimit.editImagePerHour | quote }}
+- name: UPLOAD_CORS_ORIGINS
+  value: {{ $.Values.uploads.corsOrigins | quote }}
+- name: UPLOAD_RETENTION_DAYS
+  value: {{ $.Values.uploads.retentionDays | quote }}
 {{- end }}
 {{- if ne $role "mcp" }}
 - name: WORKER_CONCURRENCY

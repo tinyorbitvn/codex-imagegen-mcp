@@ -56,6 +56,7 @@ want several images in flight.
 | `create_image` | Generates one image. Waits by default; returns `timed_out=true` rather than failing if it runs long. |
 | `edit_image` | Applies a change to an existing artifact and saves it as a NEW version. Never overwrites. |
 | `animate_image` | Turns a still artifact into a looping animated WebP plus a GIF fallback (spin, pulse, shake, bounce, float) as a NEW version. No Codex run, no quota. |
+| `upload_image` | Stores an image of your own for the other tools: inline base64 up to 700 KB, or a presigned POST target for up to 20 MB. Pass the `upload_id` as `reference_upload_ids` to `create_image`, or as `source_upload_id` to `edit_image` / `animate_image`. Private; deleted after a day by default. |
 | `get_image_job` | Job state: queued, running, completed, failed, cancelled. |
 | `get_artifact` | Artifact metadata and URL. Omit the version for the latest. |
 | `cancel_image_job` | Cancels a queued or running job. A finished job cannot be cancelled. |

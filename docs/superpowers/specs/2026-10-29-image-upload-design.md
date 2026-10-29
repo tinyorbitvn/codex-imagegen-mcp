@@ -1,6 +1,6 @@
 # upload_image: let a client hand the server its own image
 
-Date: 2026-10-29. Status: draft for review.
+Date: 2026-10-29. Status: approved design, implemented in 0.8.0.
 
 ## Goal
 

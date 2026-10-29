@@ -57,6 +57,7 @@ the process, and the chart refuses only the combinations that cannot work.
 | `worker.generatedImageRetentionHours` | `24` | Codex keeps its own copy of every image, roughly 0.7 MB per job. This is how long those copies live. |
 | `persistence.artifacts.size` | `10Gi` | Only used when images are stored locally. |
 | `rateLimit.*` | 10 create, 20 edit per hour | Per caller, read from `x-agentgateway-principal`, `x-jwt-sub` or `x-user`. With no proxy in front, every caller is `anonymous` and shares one bucket. |
+| `uploads.*` | `*`, 1 day | `upload_image`: origins allowed to POST from a browser, and days before uploads are deleted. |
 | `otlp.endpoint` | `""` | Empty disables OpenTelemetry export. |
 
 The chart fails to render, naming the value to set, rather than letting pods

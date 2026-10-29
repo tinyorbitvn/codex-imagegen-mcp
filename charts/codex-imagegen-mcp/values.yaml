@@ -55,6 +55,11 @@ rateLimit:
   createImagePerHour: 10
   editImagePerHour: 20
 
+# upload_image: browser origins allowed to POST, and days before uploads/ is deleted.
+uploads:
+  corsOrigins: "*"
+  retentionDays: 1
+
 worker:
   # Jobs at once. One ChatGPT sign-in drives one Codex process; raise this
   # only if you know the account tolerates more.
