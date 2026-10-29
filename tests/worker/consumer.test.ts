@@ -737,6 +737,23 @@ describe("consumer — the worker converts, Codex only copies", () => {
   });
 });
 
+describe("consumer — an older Codex habit still works", () => {
+  test("a PNG written straight to artifact.webp is converted in place", async () => {
+    const png = await sharp({ create: { width: 32, height: 32, channels: 3, background: "#123" } }).png().toBuffer();
+    const { consumer, store, queue, storage } = build(async (opts) => {
+      await writeFile(join(opts.cwd, "artifact.webp"), png);
+      return { exitCode: 0, durationMs: 5, stderrTail: "", threadId: "t-legacy" };
+    });
+    const s = spec({ assetId: "legacy", outputFormat: "webp", filename: "artifact.webp" });
+    await store.create(record("img_legacy_1", s));
+    await queue.enqueue(payload("img_legacy_1", s));
+
+    assert.equal(await runOnce(consumer, store, "img_legacy_1"), "completed");
+    const key = [...storage.objects.keys()].find((k) => k.includes("/legacy/") && k.endsWith("/artifact.webp"));
+    assert.equal((await sharp(storage.objects.get(key!)!).metadata()).format, "webp");
+  });
+});
+
 describe("consumer — salvage under concurrency", () => {
   // Jobs running side by side share generated_images/: the newest file there may be another job's image.
   function codexGeneratesInto(session: string, threadId: string | undefined): CodexRunner {

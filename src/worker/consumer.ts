@@ -166,7 +166,11 @@ export async function toRequestedFormat(src: string, dest: string, format: Outpu
     if (src !== dest) await rename(src, dest);
     return;
   }
-  await sharp(src).toFormat(format).toFile(dest);
+  // Through a buffer: src and dest are the same file when Codex wrote the
+  // final name itself, and sharp refuses to write over its own input.
+  const converted = await sharp(src).toFormat(format).toBuffer();
+  await writeFile(dest, converted);
+  if (src !== dest) await rm(src, { force: true });
 }
 
 /**
