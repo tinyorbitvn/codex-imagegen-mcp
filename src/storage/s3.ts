@@ -15,6 +15,13 @@ import { readFile } from "node:fs/promises";
 import { ImagegenError } from "../contracts/index.ts";
 import type { ArtifactStore, PresignedUpload, UploadBucketSettings, UploadResult } from "./types.ts";
 
+/**
+ * ACL on every upload. An object belongs to whoever wrote it, so when the MCP
+ * role writes uploads with a key of its own, the bucket owner (the worker)
+ * gets 403 reading them without this grant (RGW, 2026-10-29).
+ */
+const OWNER_READS = "bucket-owner-full-control";
+
 /** Object storage config. This package declares its own so it doesn't depend on any service's Config. */
 export interface StorageConfig {
   endpoint: string;
@@ -155,7 +162,13 @@ export class ArtifactStorage implements ArtifactStore {
   async putObject(key: string, body: Buffer, contentType: string): Promise<void> {
     try {
       await this.#client.send(
-        new PutObjectCommand({ Bucket: this.#cfg.bucket, Key: key, Body: body, ContentType: contentType }),
+        new PutObjectCommand({
+          Bucket: this.#cfg.bucket,
+          Key: key,
+          Body: body,
+          ContentType: contentType,
+          ACL: OWNER_READS,
+        }),
       );
     } catch {
       throw new ImagegenError("STORAGE_UPLOAD_FAILED", "Failed to store the upload in object storage");
@@ -175,7 +188,8 @@ export class ArtifactStorage implements ArtifactStore {
   /**
    * The policy signature covers the bucket and the form fields, not the
    * host, so the in-cluster endpoint the client signs with can be swapped
-   * for the public bucket URL the caller can actually reach.
+   * for the public bucket URL the caller can actually reach. The acl field
+   * is pinned in the policy, so a client cannot drop the owner's grant.
    */
   async presignUpload(
     key: string,
@@ -189,8 +203,9 @@ export class ArtifactStorage implements ArtifactStore {
       Conditions: [
         ["content-length-range", 1, maxBytes],
         ["eq", "$Content-Type", contentType],
+        ["eq", "$acl", OWNER_READS],
       ],
-      Fields: { "Content-Type": contentType },
+      Fields: { "Content-Type": contentType, acl: OWNER_READS },
       Expires: ttlSeconds,
     });
     return { url: this.#cfg.publicBaseUrl, fields };
@@ -200,42 +215,55 @@ export class ArtifactStorage implements ArtifactStore {
    * Replaces the bucket's CORS and lifecycle with exactly these rules: the
    * bucket belongs to this service. GET stays open to every origin because
    * artifacts are already public; POST is governed by the signed policy.
-   * Applied independently: a store without per-bucket CORS must still
-   * expire uploads.
+   * Each is attempted even if the other fails (a store without per-bucket
+   * CORS must still expire uploads), but never at the same time: RGW refused
+   * one of two concurrent bucket-config writes with ConcurrentModification.
    */
   async configureUploads(settings: UploadBucketSettings): Promise<void> {
-    const results = await Promise.allSettled([
-      this.#client.send(
-        new PutBucketCorsCommand({
-          Bucket: this.#cfg.bucket,
-          CORSConfiguration: {
-            CORSRules: [
-              { AllowedMethods: ["POST"], AllowedOrigins: settings.corsOrigins, AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
-              { AllowedMethods: ["GET", "HEAD"], AllowedOrigins: ["*"], AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
-            ],
-          },
-        }),
-      ),
-      this.#client.send(
-        new PutBucketLifecycleConfigurationCommand({
-          Bucket: this.#cfg.bucket,
-          LifecycleConfiguration: {
-            Rules: [
-              {
-                ID: "expire-uploads",
-                Status: "Enabled",
-                Filter: { Prefix: "uploads/" },
-                Expiration: { Days: settings.retentionDays },
+    const steps: Array<[string, () => Promise<unknown>]> = [
+      [
+        "CORS",
+        () =>
+          this.#client.send(
+            new PutBucketCorsCommand({
+              Bucket: this.#cfg.bucket,
+              CORSConfiguration: {
+                CORSRules: [
+                  { AllowedMethods: ["POST"], AllowedOrigins: settings.corsOrigins, AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
+                  { AllowedMethods: ["GET", "HEAD"], AllowedOrigins: ["*"], AllowedHeaders: ["*"], MaxAgeSeconds: 3000 },
+                ],
               },
-            ],
-          },
-        }),
-      ),
-    ]);
-    const failed = ["CORS", "lifecycle"].flatMap((name, i) => {
-      const r = results[i]!;
-      return r.status === "rejected" ? [`${name} (${(r.reason as Error).name})`] : [];
-    });
+            }),
+          ),
+      ],
+      [
+        "lifecycle",
+        () =>
+          this.#client.send(
+            new PutBucketLifecycleConfigurationCommand({
+              Bucket: this.#cfg.bucket,
+              LifecycleConfiguration: {
+                Rules: [
+                  {
+                    ID: "expire-uploads",
+                    Status: "Enabled",
+                    Filter: { Prefix: "uploads/" },
+                    Expiration: { Days: settings.retentionDays },
+                  },
+                ],
+              },
+            }),
+          ),
+      ],
+    ];
+    const failed: string[] = [];
+    for (const [name, step] of steps) {
+      try {
+        await step();
+      } catch (e) {
+        failed.push(`${name} (${(e as Error).name})`);
+      }
+    }
     if (failed.length > 0) throw new Error(`the bucket refused ${failed.join(" and ")}`);
   }
 }

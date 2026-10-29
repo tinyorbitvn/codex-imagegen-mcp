@@ -41,6 +41,9 @@ test("the signed policy caps the size, pins key and type, and expires on time", 
   assert.ok(has({ bucket: "mcp-artifacts" }), "bucket");
   assert.ok(has({ key: KEY }), "key");
   assert.ok(has(["eq", "$Content-Type", "image/webp"]), "content type");
+  // An object belongs to whoever wrote it: without this ACL the bucket owner (the worker) gets 403.
+  assert.ok(has(["eq", "$acl", "bucket-owner-full-control"]), "acl");
+  assert.equal(p.fields.acl, "bucket-owner-full-control");
   const ttl = Date.parse(policy.expiration) - Date.now();
   assert.ok(ttl > 890_000 && ttl <= 900_000, `expires in ${ttl} ms`);
 });
@@ -76,6 +79,72 @@ test("a bucket that refuses CORS still gets the rule that expires uploads", asyn
     });
     await assert.rejects(s.configureUploads({ corsOrigins: ["*"], retentionDays: 1 }), /CORS/);
     assert.ok(seen.some((r) => r.startsWith("PUT") && r.includes("lifecycle")), seen.join(", "));
+  } finally {
+    stub.close();
+  }
+});
+
+test("CORS and lifecycle are set one after the other, never at once", async () => {
+  // RGW refused one of two concurrent bucket-config PUTs with ConcurrentModification (0.8.0, 2026-10-29).
+  let inFlight = 0;
+  let most = 0;
+  const stub = createServer((req, res) => {
+    inFlight++;
+    most = Math.max(most, inFlight);
+    req.resume();
+    req.on("end", () =>
+      setTimeout(() => {
+        inFlight--;
+        res.writeHead(200);
+        res.end();
+      }, 50),
+    );
+  });
+  stub.listen(0);
+  await once(stub, "listening");
+  try {
+    const s = new ArtifactStorage({
+      endpoint: `http://127.0.0.1:${(stub.address() as AddressInfo).port}`,
+      bucket: "mcp-artifacts",
+      region: "us-east-1",
+      forcePathStyle: true,
+      publicBaseUrl: "https://s3.example/mcp-artifacts",
+      signedUrlTtlSeconds: 60,
+      accessKeyId: "AKIDEXAMPLE",
+      secretAccessKey: "not-a-real-secret",
+    });
+    await s.configureUploads({ corsOrigins: ["*"], retentionDays: 1 });
+    assert.equal(most, 1);
+  } finally {
+    stub.close();
+  }
+});
+
+test("an inline upload is written readable by the bucket owner", async () => {
+  const acl: Array<string | undefined> = [];
+  const stub = createServer((req, res) => {
+    acl.push(req.headers["x-amz-acl"] as string | undefined);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200);
+      res.end();
+    });
+  });
+  stub.listen(0);
+  await once(stub, "listening");
+  try {
+    const s = new ArtifactStorage({
+      endpoint: `http://127.0.0.1:${(stub.address() as AddressInfo).port}`,
+      bucket: "mcp-artifacts",
+      region: "us-east-1",
+      forcePathStyle: true,
+      publicBaseUrl: "https://s3.example/mcp-artifacts",
+      signedUrlTtlSeconds: 60,
+      accessKeyId: "AKIDEXAMPLE",
+      secretAccessKey: "not-a-real-secret",
+    });
+    await s.putObject(KEY, Buffer.from("png"), "image/png");
+    assert.deepEqual(acl, ["bucket-owner-full-control"]);
   } finally {
     stub.close();
   }
