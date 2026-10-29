@@ -48,7 +48,7 @@ the key, a plain unsigned GET, so that bucket has to allow anonymous download.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORKER_CONCURRENCY` | `1` | Jobs at once. One sign-in means one Codex process; raise only if you know the account tolerates more. |
+| `WORKER_CONCURRENCY` | `1` | Jobs at once, all on the one ChatGPT sign-in: more spends its quota faster, it does not add any. Each job salvages only from its own Codex thread, so jobs running side by side never pick up each other's images. |
 | `JOB_TIMEOUT_SECONDS` | `900` | A job is abandoned after this. Real jobs take 30 to 140 seconds. |
 | `GENERATED_IMAGE_RETENTION_HOURS` | `24` | How long Codex's own copies of generated images are kept before deletion. Roughly 0.7 MB per job, and nothing else prunes them. |
 | `WORK_DIR` | `/work/jobs` | Scratch space for in-flight jobs. |

@@ -52,7 +52,7 @@ the process, and the chart refuses only the combinations that cannot work.
 |---|---|---|
 | `split` | `false` | One process, so no Redis and no object storage needed. |
 | `replicaCount` | `1` | Only raisable with `split=true`. Without it, each replica would hold its own queue and its own sign-in, and the chart refuses. |
-| `worker.concurrency` | `1` | One ChatGPT sign-in drives one Codex process. |
+| `worker.concurrency` | `1` | Jobs at once on the one ChatGPT sign-in; more spends its quota faster. |
 | `worker.jobTimeoutSeconds` | `900` | Real jobs take 30 to 140 seconds. |
 | `worker.generatedImageRetentionHours` | `24` | Codex keeps its own copy of every image, roughly 0.7 MB per job. This is how long those copies live. |
 | `persistence.artifacts.size` | `10Gi` | Only used when images are stored locally. |

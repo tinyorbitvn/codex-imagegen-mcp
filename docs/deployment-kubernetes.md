@@ -64,9 +64,9 @@ The MCP role is stateless: raise `replicaCount` freely once `split=true`.
 There are no sticky sessions to preserve, because the transport runs in
 session-less mode.
 
-The worker is not. One sign-in drives one Codex process, so the worker stays
-at one replica and `worker.concurrency` stays at 1 unless you have given each
-replica its own sign-in volume. Without `split`, `replicaCount` above 1 is
+The worker is not. Its sign-in lives on a ReadWriteOnce volume, so the worker
+stays at one replica and scales with `worker.concurrency`: several Codex
+processes on that one sign-in, sharing its quota. Without `split`, `replicaCount` above 1 is
 refused: each pod would hold its own in-process queue and its own sign-in,
 which is not a scaled service but several disconnected ones.
 

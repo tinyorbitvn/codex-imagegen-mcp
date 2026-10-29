@@ -61,8 +61,8 @@ uploads:
   retentionDays: 1
 
 worker:
-  # Jobs at once. One ChatGPT sign-in drives one Codex process; raise this
-  # only if you know the account tolerates more.
+  # Jobs at once, all on the one ChatGPT sign-in: more spends its quota
+  # faster, it does not add any.
   concurrency: 1
   # A job is given up on after this long. Real jobs take 30 to 140 seconds.
   jobTimeoutSeconds: 900
