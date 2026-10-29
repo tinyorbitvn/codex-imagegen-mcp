@@ -159,7 +159,17 @@ describe("loadConfig defaults", () => {
 
 describe("loadConfig uploads", () => {
   test("defaults to any origin and one day", () => {
-    assert.deepEqual(loadConfig().uploads, { corsOrigins: ["*"], retentionDays: 1 });
+    assert.deepEqual(loadConfig().uploads, { corsOrigins: ["*"], retentionDays: 1, configureBucket: true });
+  });
+
+  test("only a role that runs the worker sets the bucket's CORS and lifecycle", () => {
+    // The MCP role may hold a key limited to uploads/*; the worker holds the bucket owner's.
+    process.env.REDIS_URL = "redis://redis.invalid:6379";
+    s3Env();
+    for (const [role, expected] of [["mcp", false], ["worker", true], ["all", true]] as const) {
+      process.env.ROLE = role;
+      assert.equal(loadConfig().uploads.configureBucket, expected, role);
+    }
   });
 
   test("a comma list of origins is split and trimmed", () => {

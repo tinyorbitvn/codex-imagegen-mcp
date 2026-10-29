@@ -62,7 +62,7 @@ export interface Config {
   storage:
     | { kind: "s3"; s3: StorageConfig }
     | { kind: "local"; dir: string; publicBaseUrl: string };
-  uploads: { corsOrigins: string[]; retentionDays: number };
+  uploads: { corsOrigins: string[]; retentionDays: number; configureBucket: boolean };
   mcp: {
     rateLimit: { createImagePerHour: number; editImagePerHour: number };
   };
@@ -157,6 +157,9 @@ export function loadConfig(): Config {
         .filter(Boolean),
       // A bucket lifecycle rule counts whole days, one at least.
       retentionDays: Math.max(1, int("UPLOAD_RETENTION_DAYS", 1)),
+      // The role that runs the worker holds the bucket owner's key; the MCP
+      // role may have one limited to PutObject/GetObject on uploads/*.
+      configureBucket: role !== "mcp",
     },
     mcp: {
       rateLimit: {

@@ -92,8 +92,11 @@ if (servesMcp) {
   // Only the MCP roles serve images: the worker has no route in front of
   // it and clients are never handed its address.
   if (config.storage.kind === "local") mountArtifacts(app, config.storage.dir);
+}
+
+if (config.uploads.configureBucket) {
   // Not awaited: uploads are a side door, and a bucket that refuses CORS
-  // or lifecycle must not keep the MCP endpoint from starting.
+  // or lifecycle must not keep the process from starting.
   void storage
     .configureUploads(config.uploads)
     .catch((e: unknown) => log.warn("could not configure the bucket for uploads", { error: (e as Error).message }));
