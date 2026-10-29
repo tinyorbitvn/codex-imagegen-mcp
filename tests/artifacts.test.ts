@@ -11,6 +11,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
+import { request } from "node:http";
 import type { Server } from "node:http";
 
 import { mountArtifacts } from "../src/artifacts.ts";
@@ -84,6 +85,22 @@ describe("GET /artifacts", () => {
   test("uploads are private, as on S3 where only projects/ is public", async () => {
     const res = await fetch(`${base}/artifacts/uploads/tinyorbit-cloud/upl_${"e".repeat(32)}`);
     assert.equal(res.status, 404);
+  });
+
+  test("an upload cannot be reached by walking out of projects/", async () => {
+    // node:http, not fetch: fetch's URL parser folds %2e%2e away before
+    // sending, and a hostile client sends the path exactly as written.
+    for (const walk of ["%2e%2e", ".."]) {
+      const status = await new Promise<number>((done, fail) => {
+        request(`${base}/artifacts`, { path: `/artifacts/projects/${walk}/uploads/tinyorbit-cloud/upl_${"e".repeat(32)}` }, (res) => {
+          res.resume();
+          done(res.statusCode ?? 0);
+        })
+          .on("error", fail)
+          .end();
+      });
+      assert.equal(status, 404, walk);
+    }
   });
 
   test("a traversal attempt gets a 404 and says nothing about the filesystem", async () => {

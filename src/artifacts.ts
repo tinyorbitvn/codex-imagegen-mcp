@@ -36,7 +36,10 @@ const CONTENT_TYPES: Record<string, string> = {
 };
 
 export function mountArtifacts(app: express.Express, dir: string): void {
-  const root = resolve(dir);
+  // Uploads share this directory but stay private, as on S3, where the
+  // bucket policy only makes projects/* public. Checked on the resolved
+  // path: the raw key can start with projects/ and still walk out of it.
+  const root = resolve(dir, "projects");
 
   app.get("/artifacts/*", async (req: Request, res: Response) => {
     // The key is everything after /artifacts/, slashes included:
@@ -52,16 +55,9 @@ export function mountArtifacts(app: express.Express, dir: string): void {
       if (!res.headersSent) res.status(404).json({ error: "artifact not found" });
     };
 
-    // Uploads share this directory but stay private, as on S3, where the
-    // bucket policy only makes projects/* public.
-    if (!key.startsWith("projects/")) {
-      notFound();
-      return;
-    }
-
-    const full = resolve(root, key);
-    if (key === "" || (full !== root && !full.startsWith(root + sep))) {
-      log.warn("rejected an artifact path that escapes the artifact directory");
+    const full = resolve(dir, key);
+    if (key === "" || !full.startsWith(root + sep)) {
+      log.warn("rejected an artifact path outside projects/");
       notFound();
       return;
     }
